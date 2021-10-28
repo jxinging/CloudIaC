@@ -12,13 +12,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	git "github.com/google/go-github/github"
-	"golang.org/x/oauth2"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strconv"
 	"time"
+
+	git "github.com/google/go-github/github"
+	"golang.org/x/oauth2"
 )
 
 //newGithubInstance
