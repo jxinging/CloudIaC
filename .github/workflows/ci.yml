@@ -34,11 +34,11 @@ jobs:
 
     - name: Pack
       run:|
-	rm cloudiac_v*.tar.gz cloudiac-repos_v*.tar.gz cloudiac-providers_v*.tar.gz && \
-	make package && make repos-package && make providers-package && \
-	mv cloudiac_v*.tar.gz cloudiac_$VERSION.tar.gz && \
-	mv cloudiac-repos_v*.tar.gz cloudiac-repos_$VERSION.tar.gz && \
-	mv cloudiac-providers_v*.tar.gz cloudiac-providers_$VERSION.tar.gz
+        rm cloudiac_v*.tar.gz cloudiac-repos_v*.tar.gz cloudiac-providers_v*.tar.gz && \
+        make package && make repos-package && make providers-package && \
+        mv cloudiac_v*.tar.gz cloudiac_$VERSION.tar.gz && \
+        mv cloudiac-repos_v*.tar.gz cloudiac-repos_$VERSION.tar.gz && \
+        mv cloudiac-providers_v*.tar.gz cloudiac-providers_$VERSION.tar.gz
 
     - name: Show versions
       run: ./build/iac-portal --version && ./build/ct-runner --version
@@ -47,7 +47,7 @@ jobs:
       uses: softprops/action-gh-release@v1
       if: startsWith(github.ref, 'refs/tags/v')
       with: |
-	cloudiac_$VERSION.tar.gz
-	cloudiac-repos_$VERSION.tar.gz
-	cloudiac-providers_$VERSION.tar.gz
+        cloudiac_$VERSION.tar.gz
+        cloudiac-repos_$VERSION.tar.gz
+        cloudiac-providers_$VERSION.tar.gz
 
