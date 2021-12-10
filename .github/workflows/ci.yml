@@ -33,7 +33,7 @@ jobs:
       run: go get github.com/swaggo/swag/cmd/swag && make build
 
     - name: Pack
-      run:|
+      run: |
         rm cloudiac_v*.tar.gz cloudiac-repos_v*.tar.gz cloudiac-providers_v*.tar.gz && \
         make package && make repos-package && make providers-package && \
         mv cloudiac_v*.tar.gz cloudiac_$VERSION.tar.gz && \
