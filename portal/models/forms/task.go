@@ -20,14 +20,21 @@ type DetailTaskForm struct {
 	Id models.Id `uri:"id" form:"id" json:"id" swaggerignore:"true"` // 任务ID，swagger 参数通过 param path 指定，这里忽略
 }
 
+type DetailTaskStepForm struct {
+	PageForm
+	TaskId models.Id `uri:"id" form:"id" json:"id" swaggerignore:"true"` // 任务ID，swagger 参数通过 param path 指定，这里忽略
+}
+
 type TaskLogForm struct {
 	BaseForm
-	Id       models.Id `uri:"id" form:"id" json:"id" swaggerignore:"true"` // 任务ID，swagger 参数通过 param path 指定，这里忽略
-	StepType string    `form:"stepType" json:"stepType"`                   // 步骤名称
+	Id       models.Id `uri:"id" form:"id" json:"id" swaggerignore:"true"`             // 任务ID，swagger 参数通过 param path 指定，这里忽略
+	StepType string    `form:"stepType" json:"stepType"`                               // 步骤名称
+	StepId   models.Id `uri:"stepId" form:"stepId" json:"stepId" swaggerignore:"true"` // 任务步骤步骤ID
 }
 
 type SearchTaskForm struct {
-	PageForm
+	NoPageSizeForm
+
 	EnvId models.Id `json:"envId" form:"envId" binding:"required"` // 环境ID
 }
 
@@ -67,13 +74,13 @@ type ApproveTaskForm struct {
 }
 
 type SearchEnvTasksForm struct {
-	PageForm
+	NoPageSizeForm
 
 	Id models.Id `uri:"id" json:"id" swaggerignore:"true"` // 环境ID，swagger 参数通过 param path 指定，这里忽略
 }
 
 type SearchTaskResourceForm struct {
-	PageForm
+	NoPageSizeForm
 
 	Id models.Id `uri:"id" json:"id" swaggerignore:"true"` // 任务ID，swagger 参数通过 param path 指定，这里忽略
 	Q  string    `form:"q" json:"q" binding:""`            // 资源名称，支持模糊查询
@@ -84,4 +91,17 @@ type ResourceDetailForm struct {
 
 	Id         models.Id `uri:"id" json:"id" swaggerignore:"true"`                 // 环境ID，swagger 参数通过 param path 指定，这里忽略
 	ResourceId models.Id `uri:"resourceId" json:"resourceId" swaggerignore:"true"` // 部署成功后后资源ID
+}
+
+type GetTaskStepLogForm struct {
+	BaseForm
+	Id     models.Id `uri:"id" json:"id"`         // 任务Id
+	StepId models.Id `uri:"stepId" json:"stepId"` //步骤ID
+}
+
+type SearchTaskResourceGraphForm struct {
+	BaseForm
+
+	Id        models.Id `uri:"id" json:"id" swaggerignore:"true"`              // 任务ID，swagger 参数通过 param path 指定，这里忽略
+	Dimension string    `json:"dimension" form:"dimension" binding:"required"` // 资源名称，支持模糊查询
 }

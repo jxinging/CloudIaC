@@ -8,11 +8,20 @@ import (
 	"cloudiac/runner"
 	"cloudiac/utils"
 	"database/sql/driver"
-	"fmt"
 	"path"
 )
 
 type TaskVariables []VariableBody
+
+func (v TaskVariables) Len() int {
+	return len(v)
+}
+func (v TaskVariables) Less(i, j int) bool {
+	return v[i].Name < v[j].Name
+}
+func (v TaskVariables) Swap(i, j int) {
+	v[i], v[j] = v[j], v[i]
+}
 
 func (v TaskVariables) Value() (driver.Value, error) {
 	return MarshalValue(v)
@@ -107,7 +116,7 @@ type Task struct {
 	StatePath string `json:"statePath" gorm:"not null"`
 
 	// 扩展属性，包括 source, transitionId 等
-	Extra TaskExtra `json:"extra" gorm:"type:json"` // 扩展属性
+	ExtraData JSON `json:"extraData" gorm:"type:json"` // 扩展字段，用于存储外部服务调用时的信息
 
 	KeyId           Id   `json:"keyId" gorm:"size32"` // 部署密钥ID
 	AutoApprove     bool `json:"autoApproval" gorm:"default:false"`
@@ -116,9 +125,11 @@ type Task struct {
 	// 任务执行结果，如 add/change/delete 的资源数量、outputs 等
 	Result TaskResult `json:"result" gorm:"type:json"` // 任务执行结果
 
-	RetryNumber int  `json:"retryNumber" gorm:"size:32;default:0"` // 任务重试次数
-	RetryDelay  int  `json:"retryDelay" gorm:"size:32;default:0"`  // 每次任务重试时间，单位为秒
-	RetryAble   bool `json:"retryAble" gorm:"default:false"`
+	RetryNumber int    `json:"retryNumber" gorm:"size:32;default:0"` // 任务重试次数
+	RetryDelay  int    `json:"retryDelay" gorm:"size:32;default:0"`  // 每次任务重试时间，单位为秒
+	RetryAble   bool   `json:"retryAble" gorm:"default:false"`
+	Callback    string `json:"callback" gorm:"default:''"`       // 外部请求的回调方式
+	IsDriftTask bool   `json:"isDritfTask" gorm:"default:false"` // 是否是偏移检测任务
 }
 
 func (Task) TableName() string {
@@ -127,6 +138,10 @@ func (Task) TableName() string {
 
 func (Task) DefaultTaskName() string {
 	return ""
+}
+
+func (BaseTask) NewId() Id {
+	return NewId("run")
 }
 
 func (t *BaseTask) GetId() Id {
@@ -183,6 +198,7 @@ func (BaseTask) GetTaskNameByType(typ string) string {
 		panic("invalid task type")
 	}
 }
+
 func (t *Task) StateJsonPath() string {
 	return path.Join(t.ProjectId.String(), t.EnvId.String(), t.Id.String(), runner.TFStateJsonFile)
 }
@@ -203,6 +219,10 @@ func (t *Task) TfResultJsonPath() string {
 	return path.Join(t.ProjectId.String(), t.EnvId.String(), t.Id.String(), runner.TerrascanResultFile)
 }
 
+func (t *Task) TFPlanOutputLogPath(step string) string {
+	return path.Join(t.ProjectId.String(), t.EnvId.String(), t.Id.String(), step, runner.TaskLogName)
+}
+
 func (t *Task) HideSensitiveVariable() {
 	for index, v := range t.Variables {
 		if v.Sensitive {
@@ -212,103 +232,15 @@ func (t *Task) HideSensitiveVariable() {
 }
 
 func (t *Task) Migrate(sess *db.Session) (err error) {
-	if err := sess.ModifyModelColumn(t, "status"); err != nil {
+	return TaskModelMigrate(sess, t)
+}
+
+func TaskModelMigrate(sess *db.Session, taskModel interface{}) (err error) {
+	if err := sess.ModifyModelColumn(taskModel, "status"); err != nil {
+		return err
+	}
+	if err := sess.ModifyModelColumn(taskModel, "pipeline"); err != nil {
 		return err
 	}
 	return nil
-}
-
-type TaskStepBody struct {
-	Type string   `json:"type" yaml:"type" gorm:"type:enum('init','plan','apply','play','command','destroy','scaninit','tfscan','tfparse','scan')"`
-	Name string   `json:"name,omitempty" yaml:"name" gorm:"size:32;not null"`
-	Args StrSlice `json:"args,omitempty" yaml:"args" gorm:"type:text"`
-}
-
-const (
-	TaskStepInit     = common.TaskStepInit
-	TaskStepPlan     = common.TaskStepPlan
-	TaskStepApply    = common.TaskStepApply
-	TaskStepDestroy  = common.TaskStepDestroy
-	TaskStepPlay     = common.TaskStepPlay
-	TaskStepCommand  = common.TaskStepCommand
-	TaskStepCollect  = common.TaskStepCollect
-	TaskStepTfParse  = common.TaskStepTfParse
-	TaskStepTfScan   = common.TaskStepTfScan
-	TaskStepScanInit = common.TaskStepScanInit
-
-	TaskStepPending   = common.TaskStepPending
-	TaskStepApproving = common.TaskStepApproving
-	TaskStepRejected  = common.TaskStepRejected
-	TaskStepRunning   = common.TaskStepRunning
-	TaskStepFailed    = common.TaskStepFailed
-	TaskStepComplete  = common.TaskStepComplete
-	TaskStepTimeout   = common.TaskStepTimeout
-)
-
-type TaskStep struct {
-	BaseModel
-	TaskStepBody
-
-	OrgId     Id     `json:"orgId" gorm:"size:32;not null"`
-	ProjectId Id     `json:"projectId" gorm:"size:32;not null"`
-	EnvId     Id     `json:"envId" gorm:"size:32;not null"`
-	TaskId    Id     `json:"taskId" gorm:"size:32;not null"`
-	NextStep  Id     `json:"nextStep" gorm:"size:32;default:''"`
-	Index     int    `json:"index" gorm:"size:32;not null"`
-	Status    string `json:"status" gorm:"type:enum('pending','approving','rejected','running','failed','complete','timeout')"`
-	ExitCode  int    `json:"exitCode" gorm:"default:0"` // 执行退出码，status 为 failed 时才有意义
-	Message   string `json:"message" gorm:"type:text"`
-	StartAt   *Time  `json:"startAt" gorm:"type:datetime"`
-	EndAt     *Time  `json:"endAt" gorm:"type:datetime"`
-	LogPath   string `json:"logPath" gorm:""`
-
-	ApproverId Id `json:"approverId" gorm:"size:32;not null"` // 审批者用户 id
-
-	CurrentRetryCount int   `json:"currentRetryCount" gorm:"size:32;default:0"` // 当前重试次数
-	NextRetryTime     int64 `json:"nextRetryTime" gorm:"default:0"`             // 下次重试时间
-	RetryNumber       int   `json:"retryNumber" gorm:"size:32;default:0"`       // 每个步骤可以重试的总次数
-}
-
-func (TaskStep) TableName() string {
-	return "iac_task_step"
-}
-
-func (t *TaskStep) Migrate(sess *db.Session) (err error) {
-	if err := sess.ModifyModelColumn(t, "type"); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *TaskStep) IsStarted() bool {
-	return !utils.StrInArray(s.Status, TaskStepPending, TaskStepApproving)
-}
-
-func (s *TaskStep) IsExited() bool {
-	return utils.StrInArray(s.Status, TaskStepRejected, TaskStepComplete, TaskStepFailed, TaskStepTimeout)
-}
-
-func (s *TaskStep) IsApproved() bool {
-	if s.Status == TaskStepRejected {
-		return false
-	}
-	// 只有 apply 和 destroy 步骤需要审批
-	if utils.StrInArray(s.Type, TaskStepApply, TaskStepDestroy) && len(s.ApproverId) == 0 {
-		return false
-	}
-	return true
-}
-
-func (s *TaskStep) IsRejected() bool {
-	return s.Status == TaskStepRejected
-}
-
-func (s *TaskStep) GenLogPath() string {
-	return path.Join(
-		s.ProjectId.String(),
-		s.EnvId.String(),
-		s.TaskId.String(),
-		fmt.Sprintf("step%d", s.Index),
-		runner.TaskStepLogName,
-	)
 }

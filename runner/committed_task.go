@@ -7,45 +7,49 @@ import (
 	"cloudiac/utils/logs"
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
+	"time"
 
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
 )
 
 var logger = logs.Get()
 
-type CommittedTaskStep struct {
+type StartedTask struct {
 	EnvId       string `json:"envId"`
 	TaskId      string `json:"taskId"`
 	Step        int    `json:"step"`
 	ContainerId string `json:"containerId"`
+	ExecId      string `json:"execId"`
 
-	containerInfoLock sync.RWMutex
+	StartedAt *time.Time `json:"startedAt"`
+	Timeout   int        `json:"timeout"`
+
+	PauseOnFinish bool `json:"pauseOnFinish"` // 该步骤结束时暂停容器
+
+	containerInfoLock sync.RWMutex `json:"-"`
 }
 
-func LoadCommittedTask(envId string, taskId string, step int) (*CommittedTaskStep, error) {
-	path := filepath.Join(GetTaskStepDir(envId, taskId, step), TaskStepInfoFileName)
+func LoadStartedTask(envId string, taskId string, step int) (*StartedTask, error) {
+	path := filepath.Join(GetTaskDir(envId, taskId, step), TaskInfoFileName)
 	fp, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer fp.Close()
 
-	task := CommittedTaskStep{}
+	task := StartedTask{}
 	if err := json.NewDecoder(fp).Decode(&task); err != nil {
 		return nil, err
 	}
 	return &task, nil
 }
 
-func (task *CommittedTaskStep) Cancel() error {
+func (task *StartedTask) Cancel() error {
 	cli, err := client.NewClientWithOpts()
 	cli.NegotiateAPIVersion(context.Background())
 	if err != nil {
@@ -66,37 +70,27 @@ func (task *CommittedTaskStep) Cancel() error {
 	return nil
 }
 
-func (task *CommittedTaskStep) Status() (types.ContainerJSON, error) {
+func (task *StartedTask) Status() (info types.ContainerExecInspect, err error) {
 	if task.hasContainerInfo() {
 		return task.readContainerInfo()
 	}
 
-	cli, err := client.NewClientWithOpts()
+	info, err = Executor{}.GetExecInfo(task.ExecId)
 	if err != nil {
-		logger.Warnf("unable to create docker client, error: %v", err)
-		return types.ContainerJSON{}, err
+		return info, err
 	}
-
-	cli.NegotiateAPIVersion(context.Background())
-	containerInfo, err := cli.ContainerInspect(context.Background(), task.ContainerId)
-	if err != nil {
-		logger.Errorf("failed to inspect for container: %s, error: %v ",
-			utils.ShortContainerId(task.ContainerId), err)
-		return types.ContainerJSON{}, err
-	}
-
-	return containerInfo, nil
+	return info, nil
 }
 
-func (task *CommittedTaskStep) TaskStepDir() string {
-	return GetTaskStepDir(task.EnvId, task.TaskId, task.Step)
+func (task *StartedTask) TaskDir() string {
+	return GetTaskDir(task.EnvId, task.TaskId, task.Step)
 }
 
-func (task *CommittedTaskStep) containerInfoPath() string {
-	return filepath.Join(task.TaskStepDir(), TaskStepContainerInfoFileName)
+func (task *StartedTask) containerInfoPath() string {
+	return filepath.Join(task.TaskDir(), TaskContainerInfoFileName)
 }
 
-func (task *CommittedTaskStep) writeContainerInfo(info *types.ContainerJSON) error {
+func (task *StartedTask) writeContainerInfo(info *types.ContainerExecInspect) error {
 	task.containerInfoLock.Lock()
 	defer task.containerInfoLock.Unlock()
 
@@ -108,7 +102,7 @@ func (task *CommittedTaskStep) writeContainerInfo(info *types.ContainerJSON) err
 	return json.NewEncoder(fp).Encode(info)
 }
 
-func (task *CommittedTaskStep) hasContainerInfo() bool {
+func (task *StartedTask) hasContainerInfo() bool {
 	task.containerInfoLock.RLock()
 	defer task.containerInfoLock.RUnlock()
 
@@ -122,7 +116,7 @@ func (task *CommittedTaskStep) hasContainerInfo() bool {
 	return true
 }
 
-func (task *CommittedTaskStep) readContainerInfo() (info types.ContainerJSON, err error) {
+func (task *StartedTask) readContainerInfo() (info types.ContainerExecInspect, err error) {
 	task.containerInfoLock.RLock()
 	defer task.containerInfoLock.RUnlock()
 
@@ -137,8 +131,8 @@ func (task *CommittedTaskStep) readContainerInfo() (info types.ContainerJSON, er
 }
 
 // Wait 等待任务结束返回退出码，若超时返回 error=context.DeadlineExceeded
-// 如果等待到任务结束则会将容器状态信息写入到文件，然后删除容器
-func (task *CommittedTaskStep) Wait(ctx context.Context) (int64, error) {
+// 如果等待到任务结束则会将容器状态信息写入到文件，并判断是否需要暂停容器
+func (task *StartedTask) Wait(ctx context.Context) (int64, error) {
 	logger := logger.WithField("taskId", task.TaskId).
 		WithField("containerId", utils.ShortContainerId(task.ContainerId))
 
@@ -147,57 +141,42 @@ func (task *CommittedTaskStep) Wait(ctx context.Context) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		return int64(info.State.ExitCode), nil
+		return int64(info.ExitCode), nil
 	}
 
-	cli, err := client.NewClientWithOpts()
+	var (
+		info types.ContainerExecInspect
+		err  error
+	)
+	if task.StartedAt != nil && task.Timeout > 0 {
+		deadline := task.StartedAt.Add(time.Duration(task.Timeout) * time.Second)
+		info, err = Executor{}.WaitCommandWithDeadline(ctx, task.ExecId, deadline)
+	} else {
+		info, err = Executor{}.WaitCommand(ctx, task.ExecId)
+	}
+
 	if err != nil {
+		logger.Warnf("wait step error: %v", err)
 		return 0, err
 	}
 
-	cli.NegotiateAPIVersion(ctx)
-	respCh, errCh := cli.ContainerWait(ctx, task.ContainerId, container.WaitConditionNotRunning)
-	select {
-	case resp := <-respCh:
-		if resp.Error != nil {
-			logger.Warnf("wait container response status: %v, error: %v", resp.StatusCode, resp.Error)
-			return resp.StatusCode, fmt.Errorf(resp.Error.Message)
-		} else {
-			{ // 执行结束后的处理
-				// 调用 Status() 获取一次任务最新状态，并保存状态到文件
-				if info, err := task.Status(); err != nil {
-					logger.Warnf("get task status error: %v", err)
-				} else if err := task.writeContainerInfo(&info); err != nil {
-					logger.Warnf("write container info error: %v", err)
-				}
+	// 执行结束后的处理
+	{
+		// 调用 Status() 获取一次任务最新状态，并保存状态到文件
+		if info, err = task.Status(); err != nil {
+			logger.Warnf("get task status error: %v", err)
+		} else if err := task.writeContainerInfo(&info); err != nil {
+			logger.Warnf("write container info error: %v", err)
+		}
 
-				autoRemove := utils.GetBoolEnv("IAC_AUTO_REMOVE", true)
-				if autoRemove {
-					// 删除容器
-					err := cli.ContainerRemove(context.Background(), task.ContainerId,
-						types.ContainerRemoveOptions{
-							RemoveVolumes: true,
-							RemoveLinks:   false,
-							Force:         false,
-						})
-					if err != nil {
-						// 有可能其他协程己经提交了删除，这里忽略掉这些报错
-						if !strings.Contains(err.Error(), "already in progress") &&
-							!strings.Contains(err.Error(), "No such container") {
-							logger.Warnf("remove container error: %v", err)
-						}
-					}
-				}
+		// 暂停容器
+		if task.PauseOnFinish {
+			logger.Debugf("pause container %s", info.ContainerID)
+			if err := (Executor{}).Pause(info.ContainerID); err != nil {
+				logger.Warn(err)
 			}
-
-			return resp.StatusCode, nil
 		}
-	case err := <-errCh:
-		if errdefs.IsNotFound(err) {
-			logger.Infof("container not found, Id: %s", task.ContainerId)
-			return 0, nil
-		}
-		logger.Warnf("wait container error: %v", err)
-		return 0, err
 	}
+
+	return int64(info.ExitCode), nil
 }

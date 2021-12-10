@@ -20,13 +20,18 @@ import (
 )
 
 func CreateVcs(c *ctx.ServiceContext, form *forms.CreateVcsForm) (interface{}, e.Error) {
+	token, err := utils.EncryptSecretVar(form.VcsToken)
+	if err != nil {
+		return nil, e.New(e.VcsError, err)
+	}
 	vcs, err := services.CreateVcs(c.DB(), models.Vcs{
 		OrgId:    c.OrgId,
 		Name:     form.Name,
 		VcsType:  form.VcsType,
 		Address:  form.Address,
-		VcsToken: form.VcsToken,
+		VcsToken: token,
 	})
+
 	if err != nil {
 		return nil, e.AutoNew(err, e.DBError)
 	}
@@ -64,8 +69,12 @@ func UpdateVcs(c *ctx.ServiceContext, form *forms.UpdateVcsForm) (vcs *models.Vc
 	if form.HasKey("address") {
 		attrs["address"] = form.Address
 	}
-	if form.HasKey("vcsToken") {
-		attrs["vcsToken"] = form.VcsToken
+	if form.HasKey("vcsToken") && form.VcsToken != "" {
+		token, err := utils.EncryptSecretVar(form.VcsToken)
+		if err != nil {
+			return nil, e.New(e.VcsError, err)
+		}
+		attrs["vcsToken"] = token
 	}
 	vcs, err = services.UpdateVcs(c.DB(), form.Id, attrs)
 	return
@@ -91,7 +100,7 @@ func DeleteVcs(c *ctx.ServiceContext, form *forms.DeleteVcsForm) (result interfa
 		return nil, err
 	}
 	if exist {
-		return nil, e.New(e.VcsDeleteError, fmt.Errorf("Vcs cannot be deleted. Please delete the dependent cloud template first"))
+		return nil, e.New(e.VcsDeleteError, fmt.Errorf("vcs cannot be deleted. Please delete the dependent cloud template first"))
 	}
 
 	if err := services.DeleteVcs(c.DB(), form.Id); err != nil {
@@ -209,12 +218,12 @@ func ListRepoTags(c *ctx.ServiceContext, form *forms.GetGitRevisionForm) (tags [
 
 }
 
-func VcsTfVarsSearch(c *ctx.ServiceContext, form *forms.TemplateTfvarsSearchForm) (interface{}, e.Error) {
+func VcsFileSearch(c *ctx.ServiceContext, form *forms.TemplateTfvarsSearchForm) (interface{}, e.Error) {
 	vcs, err := services.QueryVcsByVcsId(form.VcsId, c.DB())
+
 	if err != nil {
 		return nil, err
 	}
-
 	vcsService, er := vcsrv.GetVcsInstance(vcs)
 	if er != nil {
 		return nil, e.New(e.VcsError, er)
@@ -223,10 +232,22 @@ func VcsTfVarsSearch(c *ctx.ServiceContext, form *forms.TemplateTfvarsSearchForm
 	if er != nil {
 		return nil, e.New(e.VcsError, er)
 	}
+	var (
+		search string
+		path   string
+	)
+	if form.TplChecks {
+		search = consts.TplTfCheck
+		path = form.Path
+	} else {
+		search = consts.TfVarFileMatch
+	}
 	listFiles, er := repo.ListFiles(vcsrv.VcsIfaceOptions{
 		Ref:    form.RepoRevision,
-		Search: consts.TfVarFileMatch,
+		Search: search,
+		Path:   path,
 	})
+
 	if er != nil {
 		return nil, e.New(e.VcsError, er)
 	}

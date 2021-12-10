@@ -71,7 +71,8 @@ var Polices = []Policy{
 	{"login", "webhook", "*"},
 
 	// 合规策略
-	//{"login", "policies", "*"},
+	// 暂时只开放给平台管理员
+	{"root", "policies", "*"},
 
 	// 用户
 	{"admin", "users", "*"},
@@ -81,11 +82,15 @@ var Polices = []Policy{
 	{"member", "self", "read/update"},
 
 	// 组织
-	//{"root", "orgs", "*"},
+	{"root", "orgs", "*"},
 	{"login", "orgs", "read"},
 	{"admin", "orgs", "read/update"},
 	{"admin", "orgs", "listuser/adduser/removeuser/updaterole"},
 	{"member", "orgs", "read"},
+
+	// 资源账号(变量组)
+	{"admin", "var_groups", "*"},
+	{"member", "var_groups", "read"},
 
 	{"admin", "projects", "*"},
 	{"member", "projects", "read"},
@@ -127,12 +132,10 @@ var Polices = []Policy{
 
 	//token
 	{"admin", "tokens", "*"},
-	{"member", "tokens", "read"},
 
 	{"manager", "tokens", "*"},
 	{"approver", "tokens", "*"},
 	{"operator", "tokens", "*"},
-	{"guest", "tokens", "read"},
 
 	//通知
 	{"admin", "notifications", "*"},
@@ -148,6 +151,7 @@ var Polices = []Policy{
 	{"guest", "vcs", "read"},
 
 	//runner
+	{"member", "runners", "read"},
 	{"manager", "runners", "read"},
 	{"approver", "runners", "read"},
 	{"operator", "runners", "read"},

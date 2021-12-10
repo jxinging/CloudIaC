@@ -294,7 +294,7 @@ func DetailPolicy(dbSess *db.Session, id models.Id) (interface{}, e.Error) {
 }
 
 func SearchPolicyTpl(dbSess *db.Session, orgId, tplId models.Id, q string) *db.Session {
-	query := dbSess.Table("iac_template AS tpl")
+	query := dbSess.Table("iac_template AS tpl").Where("tpl.deleted_at_t = 0")
 	if orgId != "" {
 		query = query.Where("tpl.org_id = ?", orgId)
 	}
@@ -400,7 +400,7 @@ func TplOfPolicyGroup(dbSess *db.Session, form *forms.TplOfPolicyGroupForm) *db.
 		Joins(fmt.Sprintf("left join %s as rel on rel.group_id = iac_policy_group.id and rel.tpl_id = ?", models.PolicyRel{}.TableName()), form.Id).
 		Where("rel.scope = ?", models.PolicyRelScopeTpl)
 
-	return query.LazySelectAppend(fmt.Sprintf("%s.id as group_id, %s.name as group_name", pTable, pTable))
+	return query.LazySelectAppend(fmt.Sprintf("%s.id as group_id, %s.name as group_name", pTable, pTable)).Order("group_name desc")
 }
 
 func PolicyError(query *db.Session, policyId models.Id) *db.Session {

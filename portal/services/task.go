@@ -4,6 +4,7 @@ package services
 
 import (
 	"cloudiac/common"
+	"cloudiac/configs"
 	"cloudiac/portal/consts"
 	"cloudiac/portal/consts/e"
 	"cloudiac/portal/libs/db"
@@ -13,6 +14,7 @@ import (
 	"cloudiac/portal/services/vcsrv"
 	"cloudiac/runner"
 	"cloudiac/utils"
+	"cloudiac/utils/kafka"
 	"cloudiac/utils/logs"
 	"context"
 	"encoding/json"
@@ -24,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/acarl005/stripansi"
 	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
 )
@@ -41,14 +44,140 @@ func GetTask(dbSess *db.Session, id models.Id) (*models.Task, e.Error) {
 	return &task, nil
 }
 
+func DeleteTaskStep(tx *db.Session, taskId models.Id) e.Error {
+	step := models.TaskStep{}
+	_, err := tx.Where("task_id = ?", taskId).Delete(&step)
+	if err != nil {
+		return e.New(e.DBError, err)
+	}
+	return nil
+}
+
+// 删除环境下所有的偏移检测资源信息
+func DeleteEnvResourceDrift(tx *db.Session, taskId models.Id) e.Error {
+	drift := models.ResourceDrift{}
+	_, err := tx.Where("res_id in (select id from iac_resource where task_id = ?)", taskId).Delete(&drift)
+	if err != nil {
+		return e.New(e.DBError, err)
+	}
+	return nil
+}
+
+// 删除已经手动恢复的资源
+func DeleteEnvResourceDriftByAddressList(tx *db.Session, taskId models.Id, addressList []string) e.Error {
+	drift := models.ResourceDrift{}
+	_, err := tx.Where("res_id in (select id from iac_resource where task_id = ? and address not in (?))",
+		taskId, addressList).Delete(&drift)
+	if err != nil {
+		return e.New(e.DBError, err)
+	}
+	return nil
+}
+
+func DeleteTask(tx *db.Session, taskId models.Id) e.Error {
+	step := models.Task{}
+	_, err := tx.Where("id = ?", taskId).Delete(&step)
+	if err != nil {
+		return e.New(e.DBError, err)
+	}
+	return nil
+}
+
+func DeleteHistoryCronTask(tx *db.Session) e.Error {
+	task := make([]models.Task, 0)
+	err := tx.Where("unix_timestamp(now()) - unix_timestamp(end_at) > ? and is_drift_task = ? and type = ?",
+		86400*7, true, models.TaskTypePlan).Find(&task)
+	if err != nil {
+		return e.New(e.DBError, fmt.Errorf("delete task error: %v", err))
+	}
+	// 删除任务以及任务相关的step
+	if len(task) > 0 {
+		for _, v := range task {
+			if er1 := DeleteTask(tx, v.Id); er1 != nil {
+				return er1
+			}
+			if er1 := DeleteTaskStep(tx, v.Id); er1 != nil {
+				return er1
+			}
+		}
+	}
+	return nil
+}
+
+func GetResourceIdByAddressAndTaskId(sess *db.Session, address string, lastResTaskId models.Id) (*models.Resource, e.Error) {
+	res := models.Resource{}
+	if err := sess.Where("address = ? and task_id = ?", address, lastResTaskId).First(&res); err != nil {
+		return nil, e.New(e.DBError, err)
+	}
+	return &res, nil
+}
+
+func CloneNewDriftTask(tx *db.Session, src models.Task, env *models.Env) (*models.Task, e.Error) {
+	// logger := logs.Get().WithField("func", "CreateTask")
+	// logger = logger.WithField("taskId", pt.Id)
+	tpl, err := GetTemplateById(tx, src.TplId)
+	if err != nil {
+		return nil, e.New(e.InternalError, err)
+	}
+
+	// 克隆任务需要重置部分任务参数
+	var cronTaskType string
+	if env.AutoRepairDrift {
+		cronTaskType = models.TaskTypeApply
+	} else {
+		cronTaskType = models.TaskTypePlan
+	}
+
+	// 获取最新 repoAddr(带 token)，确保 vcs 更新后任务还可以正常 checkout 代码
+	repoAddr, _, err := GetTaskRepoAddrAndCommitId(tx, tpl, src.Revision)
+	if err != nil {
+		return nil, e.AutoNew(err, e.InternalError)
+	}
+
+	task, er := newCommonTask(tpl, env, src)
+	if er != nil {
+		return nil, er
+	}
+
+	task.Name = common.CronDriftTaskName
+	task.Type = cronTaskType
+	task.IsDriftTask = true
+	task.RepoAddr = repoAddr
+	task.CommitId = src.CommitId
+	task.CreatorId = consts.SysUserId
+	task.AutoApprove = env.AutoApproval
+	task.StopOnViolation = env.StopOnViolation
+	task.RunnerId = env.RunnerId
+	task.KeyId = env.KeyId
+
+	return doCreateTask(tx, *task, tpl, env)
+}
+
 func CreateTask(tx *db.Session, tpl *models.Template, env *models.Env, pt models.Task) (*models.Task, e.Error) {
-	logger := logs.Get().WithField("func", "CreateTask")
+	// logger := logs.Get().WithField("func", "CreateTask")
+	// logger = logger.WithField("taskId", task.Id)
+	task, er := newCommonTask(tpl, env, pt)
+	if er != nil {
+		return nil, er
+	}
 
 	var (
 		err      error
-		firstVal = utils.FirstValueStr
+		commitId string
 	)
+	task.RepoAddr, commitId, err = GetTaskRepoAddrAndCommitId(tx, tpl, task.Revision)
+	if err != nil {
+		return nil, e.New(e.InternalError, err)
+	}
+	if task.CommitId == "" {
+		task.CommitId = commitId
+	}
 
+	return doCreateTask(tx, *task, tpl, env)
+}
+
+func newCommonTask(tpl *models.Template, env *models.Env, pt models.Task) (*models.Task, e.Error) {
+	firstVal := utils.FirstValueStr
 	task := models.Task{
 		// 以下为需要外部传入的属性
 		Name:            pt.Name,
@@ -57,14 +186,16 @@ func CreateTask(tx *db.Session, tpl *models.Template, env *models.Env, pt models
 		Variables:       pt.Variables,
 		AutoApprove:     pt.AutoApprove,
 		KeyId:           models.Id(firstVal(string(pt.KeyId), string(env.KeyId))),
-		Extra:           pt.Extra,
+		ExtraData:       pt.ExtraData,
 		Revision:        firstVal(pt.Revision, env.Revision, tpl.RepoRevision),
+		CommitId:        pt.CommitId,
 		StopOnViolation: pt.StopOnViolation,
 
 		RetryDelay:  utils.FirstValueInt(pt.RetryDelay, env.RetryDelay),
 		RetryNumber: utils.FirstValueInt(pt.RetryNumber, env.RetryNumber),
-		RetryAble:   env.RetryAble,
+		RetryAble:   utils.FirstValueBool(pt.RetryAble, env.RetryAble),
 
+		// 以下值直接使用环境的配置(不继承模板的配置)
 		OrgId:     env.OrgId,
 		ProjectId: env.ProjectId,
 		TplId:     env.TplId,
@@ -74,38 +205,30 @@ func CreateTask(tx *db.Session, tpl *models.Template, env *models.Env, pt models
 		Workdir:   tpl.Workdir,
 		TfVersion: tpl.TfVersion,
 
-		// 以下值直接使用环境的配置(不继承模板的配置)
 		Playbook:     env.Playbook,
 		TfVarsFile:   env.TfVarsFile,
 		PlayVarsFile: env.PlayVarsFile,
 
 		BaseTask: models.BaseTask{
 			Type:        pt.Type,
-			Flow:        pt.Flow,
-			StepTimeout: pt.StepTimeout,
+			Pipeline:    pt.Pipeline,
+			StepTimeout: utils.FirstValueInt(pt.StepTimeout, common.DefaultTaskStepTimeout),
 			RunnerId:    firstVal(pt.RunnerId, env.RunnerId),
 
 			Status:   models.TaskPending,
 			Message:  "",
 			CurrStep: 0,
 		},
+		Callback: pt.Callback,
 	}
+	task.Id = models.Task{}.NewId()
+	return &task, nil
+}
 
-	task.Id = models.NewId("run")
-	logger = logger.WithField("taskId", task.Id)
-
-	if len(task.Flow.Steps) == 0 {
-		task.Flow, err = models.DefaultTaskFlow(task.Type)
-		if err != nil {
-			return nil, e.New(e.InternalError, err)
-		}
-	}
-
-	task.RepoAddr, task.CommitId, err = GetTaskRepoAddrAndCommitId(tx, tpl, task.Revision)
-	if err != nil {
-		return nil, e.New(e.InternalError, err)
-	}
-
+func doCreateTask(tx *db.Session, task models.Task, tpl *models.Template, env *models.Env) (*models.Task, e.Error) {
+	// pipeline 内容可以从外部传入，如果没有传则尝试读取云模板目录下的文件
+	var err error
+	logger := logs.Get().WithField("func", "doCreateTask")
 	{ // 参数检查
 		if task.Playbook != "" && task.KeyId == "" {
 			return nil, e.New(e.BadParam, fmt.Errorf("'keyId' is required to run playbook"))
@@ -120,50 +243,42 @@ func CreateTask(tx *db.Session, tpl *models.Template, env *models.Env, pt models
 			return nil, e.New(e.BadParam, fmt.Errorf("'runnerId' is required"))
 		}
 	}
-
-	if _, err = tx.Save(&task); err != nil {
-		return nil, e.New(e.DBError, errors.Wrapf(err, "save task"))
+	if task.Pipeline == "" {
+		task.Pipeline, err = GetTplPipeline(tx, tpl.Id, task.Revision, task.Workdir)
+		if err != nil {
+			return nil, e.AutoNew(err, e.InvalidPipeline)
+		}
 	}
 
-	flowSteps := make([]models.TaskStepBody, 0, len(task.Flow.Steps))
-	for i := range task.Flow.Steps {
-		step := task.Flow.Steps[i]
-		if step.Type == models.TaskStepPlay && task.Playbook == "" {
-			logger.WithField("step", fmt.Sprintf("%d(%s)", i, step.Type)).
+	pipeline, err := DecodePipeline(task.Pipeline)
+	if err != nil {
+		return nil, e.New(e.InvalidPipeline, err)
+	}
+
+	task.Flow = GetTaskFlowWithPipeline(pipeline, task.Type)
+	steps := make([]models.TaskStep, 0)
+	stepIndex := 0
+	for i, pipelineStep := range task.Flow.Steps {
+		if pipelineStep.Type == models.TaskStepPlay && task.Playbook == "" {
+			logger.WithField("step", fmt.Sprintf("%d(%s)", i, pipelineStep.Type)).
 				Infof("not have playbook, skip this step")
 			continue
-		} else if step.Type == models.TaskStepTfScan {
+		} else if pipelineStep.Type == models.TaskStepOpaScan {
 			// 如果环境扫描未启用，则跳过扫描步骤
 			if enabled, _ := IsEnvEnabledScan(tx, task.EnvId); !enabled {
 				continue
 			}
 		}
-		flowSteps = append(flowSteps, step)
-	}
 
-	if len(flowSteps) == 0 {
-		return nil, e.New(e.TaskNotHaveStep, fmt.Errorf("task have no steps"))
-	}
-
-	var preStep *models.TaskStep
-	for i := len(flowSteps) - 1; i >= 0; i-- { // 倒序保存 steps，以便于设置 step.NextStep
-		step := flowSteps[i]
-
-		if len(task.Targets) != 0 && IsTerraformStep(step.Type) {
-			if step.Type != models.TaskStepInit {
+		if len(task.Targets) != 0 && IsTerraformStep(pipelineStep.Type) {
+			if pipelineStep.Type != models.TaskStepInit {
 				for _, t := range task.Targets {
-					step.Args = append(step.Args, fmt.Sprintf("-target=%s", t))
+					pipelineStep.Args = append(pipelineStep.Args, fmt.Sprintf("-target=%s", t))
 				}
 			}
-			// TODO: tfVars, playVars 也以这种方式传入？
 		}
 
-		nextStepId := models.Id("")
-		if preStep != nil {
-			nextStepId = preStep.Id
-		}
-
-		if step.Type == models.TaskStepTfScan {
+		if pipelineStep.Type == models.TaskStepOpaScan {
 			// 对于包含扫描的任务，创建一个对应的 scanTask 作为扫描任务记录，便于后期扫描状态的查询
 			scanTask := CreateMirrorScanTask(&task)
 			if _, err := tx.Save(scanTask); err != nil {
@@ -175,21 +290,36 @@ func CreateTask(tx *db.Session, tpl *models.Template, env *models.Env, pt models
 			}
 		}
 
-		var er e.Error
-		preStep, er = createTaskStep(tx, task, step, i, nextStepId)
-		if er != nil {
-			return nil, e.New(er.Code(), errors.Wrapf(er, "save task step"))
-		}
+		taskStep := newTaskStep(tx, task, pipelineStep, stepIndex)
+
+		steps = append(steps, *taskStep)
+		stepIndex += 1
 	}
 
+	if len(steps) == 0 {
+		return nil, e.New(e.TaskNotHaveStep, fmt.Errorf("task have no steps"))
+	}
+
+	if err = tx.Insert(&task); err != nil {
+		return nil, e.New(e.DBError, errors.Wrapf(err, "save task"))
+	}
+
+	for i := range steps {
+		if i+1 < len(steps) {
+			steps[i].NextStep = steps[i+1].Id
+		}
+		if err = tx.Insert(&steps[i]); err != nil {
+			return nil, e.New(e.DBError, errors.Wrapf(err, "save task step"))
+		}
+	}
 	return &task, nil
 }
 
 func GetTaskRepoAddrAndCommitId(tx *db.Session, tpl *models.Template, revision string) (repoAddr, commitId string, err e.Error) {
 	var (
 		u         *url.URL
-		repoToken = tpl.RepoToken
 		er        error
+		repoToken = tpl.RepoToken
 	)
 
 	repoAddr = tpl.RepoAddr
@@ -229,7 +359,11 @@ func GetTaskRepoAddrAndCommitId(tx *db.Session, tpl *models.Template, revision s
 		}
 
 		if repoToken == "" {
-			repoToken = vcs.VcsToken
+			token, err := vcs.DecryptToken()
+			if err != nil {
+				return "", "", e.New(e.VcsError, er)
+			}
+			repoToken = token
 		}
 	}
 
@@ -246,6 +380,16 @@ func GetTaskRepoAddrAndCommitId(tx *db.Session, tpl *models.Template, revision s
 	repoAddr = u.String()
 
 	return repoAddr, commitId, nil
+}
+
+func ListPendingCronTask(tx *db.Session, envId models.Id) (bool, e.Error) {
+	query := tx.Where("env_id = ? AND is_drift_task = 1 AND status IN (?)", envId,
+		[]string{models.TaskPending, models.TaskRunning, models.TaskApproving})
+	exist, err := query.Model(&models.Task{}).Exists()
+	if err != nil {
+		return exist, e.New(e.DBError, err)
+	}
+	return exist, nil
 }
 
 func GetTaskById(tx *db.Session, id models.Id) (*models.Task, e.Error) {
@@ -290,7 +434,7 @@ func stepStatus2TaskStatus(s string) string {
 func ChangeTaskStatusWithStep(dbSess *db.Session, task models.Tasker, step *models.TaskStep) e.Error {
 	switch t := task.(type) {
 	case *models.Task:
-		return ChangeTaskStatus(dbSess, t, stepStatus2TaskStatus(step.Status), step.Message)
+		return ChangeTaskStatus(dbSess, t, stepStatus2TaskStatus(step.Status), step.Message, false)
 	case *models.ScanTask:
 		return ChangeScanTaskStatusWithStep(dbSess, t, step)
 	default:
@@ -299,7 +443,7 @@ func ChangeTaskStatusWithStep(dbSess *db.Session, task models.Tasker, step *mode
 }
 
 // ChangeTaskStatus 修改任务状态(同步修改 StartAt、EndAt 等)，并同步修改 env 状态
-func ChangeTaskStatus(dbSess *db.Session, task *models.Task, status, message string) e.Error {
+func ChangeTaskStatus(dbSess *db.Session, task *models.Task, status, message string, skipUpdateEnv bool) e.Error {
 	preStatus := task.Status
 	if preStatus == status && message == "" {
 		return nil
@@ -319,15 +463,34 @@ func ChangeTaskStatus(dbSess *db.Session, task *models.Task, status, message str
 	if _, err := dbSess.Model(task).Update(task); err != nil {
 		return e.AutoNew(err, e.DBError)
 	}
-	if preStatus != status {
+
+	// 回调的消息通知只发送一次, 作业结束后发送通知
+	if task.Callback != "" && task.Exited() {
+		switch task.Callback {
+		case consts.TaskCallbackKafka:
+			SendKafkaMessage(dbSess, task, status)
+		default:
+			logs.Get().Infof("callback type don't support")
+		}
+	}
+
+	if preStatus != status && !task.IsDriftTask {
 		TaskStatusChangeSendMessage(task, status)
 	}
 
-	step, er := GetTaskStep(dbSess, task.Id, task.CurrStep)
-	if er != nil {
-		return e.AutoNew(er, e.DBError)
+	// 如果勾选提交pr自动plan，任务结束时 plan作业结果写入PR评论中
+	if task.Exited() && task.Type == common.TaskTypePlan {
+		SendVcsComment(dbSess, task, status)
 	}
-	return ChangeEnvStatusWithTaskAndStep(dbSess, task.EnvId, task, step)
+
+	if !skipUpdateEnv {
+		step, er := GetTaskStep(dbSess, task.Id, task.CurrStep)
+		if er != nil {
+			return e.AutoNew(er, e.DBError)
+		}
+		return ChangeEnvStatusWithTaskAndStep(dbSess, task.EnvId, task, step)
+	}
+	return nil
 }
 
 type TfState struct {
@@ -603,12 +766,74 @@ func SaveTaskChanges(dbSess *db.Session, task *models.Task, rs []TfPlanResource)
 	return nil
 }
 
+func GetTaskStepByStepId(tx *db.Session, stepId models.Id) (*models.TaskStep, error) {
+	taskStep := models.TaskStep{}
+	err := tx.Where("id = ?", stepId).First(&taskStep)
+	if err != nil {
+		if e.IsRecordNotFound(err) {
+			return nil, e.New(e.TaskStepNotExists)
+		}
+		return nil, e.New(e.DBError, err)
+	}
+	return &taskStep, nil
+}
+
 func FetchTaskLog(ctx context.Context, task models.Tasker, stepType string, writer io.WriteCloser) (err error) {
 	// close 后 read 端会触发 EOF error
 	defer writer.Close()
 
-	var steps []*models.TaskStep
+	var (
+		steps        []*models.TaskStep
+		fetchedSteps = make(map[string]struct{})
+	)
+
 	steps, err = GetTaskSteps(db.Get(), task.GetId())
+	if err != nil {
+		return err
+	}
+
+	for {
+		for _, s := range steps {
+			if stepType != "" && s.Type != stepType {
+				continue
+			}
+			if _, ok := fetchedSteps[s.Id.String()]; ok {
+				continue
+			}
+			if err := fetchTaskStepLog(ctx, task, writer, s.Id); err != nil {
+				return err
+			}
+			fetchedSteps[s.Id.String()] = struct{}{}
+		}
+
+		if task.Exited() {
+			break
+		}
+
+		// 因为有 callback 步骤，所以任务的步骤是会新增的(但只加到末尾)。
+		// 我们等待一定时间，确保没有新的步骤了才退出循环
+		time.Sleep(consts.DbTaskPollInterval * 2)
+		steps, err = GetTaskSteps(db.Get(), task.GetId())
+		if err != nil {
+			return err
+		}
+		if len(steps) <= len(fetchedSteps) {
+			break
+		}
+	}
+
+	return nil
+}
+
+func FetchTaskStepLog(ctx context.Context, task models.Tasker, writer io.WriteCloser, stepId models.Id) (err error) {
+	// close 后 read 端会触发 EOF error
+	defer writer.Close()
+	return fetchTaskStepLog(ctx, task, writer, stepId)
+}
+
+func fetchTaskStepLog(ctx context.Context, task models.Tasker, writer io.Writer, stepId models.Id) (err error) {
+
+	step, err := GetTaskStepByStepId(db.Get(), stepId)
 	if err != nil {
 		return err
 	}
@@ -618,10 +843,7 @@ func FetchTaskLog(ctx context.Context, task models.Tasker, stepType string, writ
 	ticker := time.NewTicker(sleepDuration)
 	defer ticker.Stop()
 
-	for _, step := range steps {
-		if stepType != "" && step.Type != stepType {
-			continue
-		}
+	for _, step := range []*models.TaskStep{step} {
 		//logger := logs.Get().WithField("step", fmt.Sprintf("%s(%d)", step.Type, step.Index))
 		// 任务有可能未开始执行步骤就退出了，所以需要先判断任务是否退出
 		for !task.Exited() && !step.IsStarted() {
@@ -694,26 +916,29 @@ func fetchRunnerTaskStepLog(ctx context.Context, runnerId string, step *models.T
 
 	runnerAddr, err := GetRunnerAddress(runnerId)
 	if err != nil {
-		return errors.Wrapf(err, "get runner address")
+		return err
 	}
 
 	params := url.Values{}
 	params.Add("envId", string(step.EnvId))
 	params.Add("taskId", string(step.TaskId))
 	params.Add("step", fmt.Sprintf("%d", step.Index))
-	wsConn, resp, err := utils.WebsocketDail(runnerAddr, consts.RunnerTaskLogFollowURL, params)
+	wsConn, resp, err := utils.WebsocketDail(runnerAddr, consts.RunnerTaskStepLogFollowURL, params)
 	if err != nil {
 		if resp != nil {
-			respBody, _ := io.ReadAll(resp.Body)
-			logger.Debugf("websocket dail error: %s, response: %s", err, respBody)
 			if resp.StatusCode == http.StatusNotFound {
 				return ErrRunnerTaskNotExists
 			}
+			respBody, _ := io.ReadAll(resp.Body)
+			logger.Warnf("websocket dail error: %s, response: %s", err, respBody)
 		}
-		return errors.Wrapf(err, "websocket dail: %v/%s", runnerAddr, consts.RunnerTaskLogFollowURL)
+		return errors.Wrapf(err, "websocket dail: %s/%s", runnerAddr, consts.RunnerTaskStepLogFollowURL)
 	}
 
 	defer func() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
 		_ = utils.WebsocketClose(wsConn)
 	}()
 
@@ -726,7 +951,7 @@ func fetchRunnerTaskStepLog(ctx context.Context, runnerId string, step *models.T
 				logger.Tracef("read message error: %v", err)
 				return nil
 			} else {
-				logger.Errorf("read message error: %v", err)
+				logger.Warnf("read message error: %v", err)
 				return err
 			}
 		} else {
@@ -769,7 +994,6 @@ func TaskStatusChangeSendMessage(task *models.Task, status string) {
 		Task:      task,
 		EventType: consts.TaskStatusToEventType[status],
 	})
-
 	logs.Get().WithField("taskId", task.Id).Infof("new event: %s", ns.EventType)
 	ns.SendMessage()
 }
@@ -811,7 +1035,7 @@ func ChangeScanTaskStatusWithStep(dbSess *db.Session, task *models.ScanTask, ste
 	case common.TaskComplete:
 		task.PolicyStatus = common.PolicyStatusPassed
 	case common.TaskFailed:
-		if step.Type == common.TaskStepTfScan && exitCode == common.TaskStepPolicyViolationExitCode {
+		if step.Type == common.TaskStepOpaScan && exitCode == common.TaskStepPolicyViolationExitCode {
 			task.PolicyStatus = common.PolicyStatusViolated
 		} else {
 			task.PolicyStatus = common.PolicyStatusFailed
@@ -826,16 +1050,16 @@ func CreateScanTask(tx *db.Session, tpl *models.Template, env *models.Env, pt mo
 	logger := logs.Get().WithField("func", "CreateScanTask")
 
 	var (
-		er  error
-		err e.Error
+		err error
+		er  e.Error
 	)
 	envRevison := ""
 
 	envId := models.Id("")
-	if env != nil {
-		tpl, err = GetTemplateById(tx, env.TplId)
-		if err != nil {
-			return nil, e.New(err.Code(), err, http.StatusBadRequest)
+	if env != nil { // env != nil 表示为环境扫描任务
+		tpl, er = GetTemplateById(tx, env.TplId)
+		if er != nil {
+			return nil, e.New(er.Code(), err, http.StatusBadRequest)
 		}
 		envId = env.Id
 		envRevison = env.Revision
@@ -859,8 +1083,7 @@ func CreateScanTask(tx *db.Session, tpl *models.Template, env *models.Env, pt mo
 
 		BaseTask: models.BaseTask{
 			Type:        pt.Type,
-			Flow:        pt.Flow,
-			StepTimeout: pt.StepTimeout,
+			StepTimeout: utils.FirstValueInt(pt.StepTimeout, common.DefaultTaskStepTimeout),
 			RunnerId:    pt.RunnerId,
 
 			Status:   models.TaskPending,
@@ -871,13 +1094,6 @@ func CreateScanTask(tx *db.Session, tpl *models.Template, env *models.Env, pt mo
 
 	task.Id = models.NewId("run")
 	logger = logger.WithField("taskId", task.Id)
-
-	if len(task.Flow.Steps) == 0 {
-		task.Flow, er = models.DefaultTaskFlow(task.Type)
-		if er != nil {
-			return nil, e.New(e.InternalError, err)
-		}
-	}
 
 	task.RepoAddr, task.CommitId, err = GetTaskRepoAddrAndCommitId(tx, tpl, task.Revision)
 	if err != nil {
@@ -896,57 +1112,42 @@ func CreateScanTask(tx *db.Session, tpl *models.Template, env *models.Env, pt mo
 		}
 	}
 
-	if _, er = tx.Save(&task); er != nil {
-		return nil, e.New(e.DBError, errors.Wrapf(er, "save task"))
+	task.Pipeline, err = GetTplPipeline(tx, tpl.Id, task.Revision, task.Workdir)
+	if err != nil {
+		return nil, e.AutoNew(err, e.InvalidPipeline)
 	}
 
-	flowSteps := make([]models.TaskStepBody, 0, len(task.Flow.Steps))
-	for i := range task.Flow.Steps {
-		step := task.Flow.Steps[i]
-		flowSteps = append(flowSteps, step)
+	pipeline, err := DecodePipeline(task.Pipeline)
+	if err != nil {
+		return nil, e.New(e.InvalidPipeline, err)
 	}
 
-	if len(flowSteps) == 0 {
+	task.Flow = GetTaskFlowWithPipeline(pipeline, task.Type)
+	steps := make([]models.TaskStep, 0)
+	stepIndex := 0
+	for _, pipelineStep := range task.Flow.Steps {
+		taskStep := newScanTaskStep(tx, task, pipelineStep, stepIndex)
+		steps = append(steps, *taskStep)
+		stepIndex += 1
+	}
+
+	if len(steps) == 0 {
 		return nil, e.New(e.TaskNotHaveStep, fmt.Errorf("task have no steps"))
 	}
 
-	var preStep *models.TaskStep
-	for i := len(flowSteps) - 1; i >= 0; i-- { // 倒序保存 steps，以便于设置 step.NextStep
-		step := flowSteps[i]
-
-		nextStepId := models.Id("")
-		if preStep != nil {
-			nextStepId = preStep.Id
-		}
-		var er e.Error
-		preStep, er = createScanTaskStep(tx, task, step, i, nextStepId)
-		if er != nil {
-			return nil, e.New(er.Code(), errors.Wrapf(er, "save task step"))
-		}
+	if err := tx.Insert(&task); err != nil {
+		return nil, e.New(e.DBError, errors.Wrapf(err, "save task"))
 	}
 
+	for i := range steps {
+		if i+1 < len(steps) {
+			steps[i].NextStep = steps[i+1].Id
+		}
+		if err := tx.Insert(&steps[i]); err != nil {
+			return nil, e.New(e.DBError, errors.Wrapf(err, "save task step"))
+		}
+	}
 	return &task, nil
-}
-
-func createScanTaskStep(tx *db.Session, task models.ScanTask, stepBody models.TaskStepBody, index int, nextStep models.Id) (*models.TaskStep, e.Error) {
-	s := models.TaskStep{
-		TaskStepBody: stepBody,
-		OrgId:        task.OrgId,
-		//ProjectId:    task.ProjectId,
-		//EnvId:    task.EnvId,
-		TaskId:   task.Id,
-		Index:    index,
-		Status:   models.TaskStepPending,
-		Message:  "",
-		NextStep: nextStep,
-	}
-	s.Id = models.NewId("step")
-	s.LogPath = s.GenLogPath()
-
-	if _, err := tx.Save(&s); err != nil {
-		return nil, e.New(e.DBError, err)
-	}
-	return &s, nil
 }
 
 func GetScanTaskById(tx *db.Session, id models.Id) (*models.ScanTask, e.Error) {
@@ -976,6 +1177,162 @@ func CreateMirrorScanTask(task *models.Task) *models.ScanTask {
 		Workdir:      task.Workdir,
 		Mirror:       true,
 		MirrorTaskId: task.Id,
-		Extra:        task.Extra,
 	}
+}
+
+// 查询任务所有的步骤信息
+func QueryTaskStepsById(query *db.Session, taskId models.Id) *db.Session {
+	return query.Model(&models.TaskStep{}).Where("task_id = ?", taskId).Order("`index`")
+}
+
+// 查询任务下某一个单独步骤的具体执行日志
+func GetTaskStepLogById(tx *db.Session, stepId models.Id) ([]byte, e.Error) {
+	query := tx.Joins("left join iac_task_step on iac_task_step.log_path=iac_storage.path").
+		Where("iac_task_step.id = ?", stepId).
+		LazySelectAppend("iac_storage.content")
+
+	var dbStorage models.DBStorage
+	if err := query.Find(&dbStorage); err != nil {
+		return nil, e.New(e.DBError, err)
+	}
+	return dbStorage.Content, nil
+}
+
+func SendKafkaMessage(session *db.Session, task *models.Task, taskStatus string) {
+	resources := make([]models.Resource, 0)
+	if err := session.Model(models.Resource{}).Where("org_id = ? AND project_id = ? AND env_id = ? AND task_id = ?",
+		task.OrgId, task.ProjectId, task.EnvId, task.Id).Find(&resources); err != nil {
+		logs.Get().Errorf("kafka send error, get resource data err: %v", err)
+		return
+	}
+	k := kafka.Get()
+	message := k.GenerateKafkaContent(task, taskStatus, resources)
+	if err := k.ConnAndSend(message); err != nil {
+		logs.Get().Errorf("kafka send error: %v", err)
+		return
+	}
+	logs.Get().Infof("kafka send massage successful. data: %s", string(message))
+}
+
+type Resource struct {
+	models.Resource
+	DriftDetail string       `json:"driftDetail"`
+	DriftAt     *models.Time `json:"driftAt"`
+	IsDrift     bool         `json:"isDrift" form:"isDrift" `
+}
+
+func GetTaskResourceToTaskId(dbSess *db.Session, task *models.Task) ([]Resource, e.Error) {
+	// 查询出最后一次漂移检测的资源
+	// 资源类型: 新增、删除、修改
+	rs := make([]Resource, 0)
+	if err := dbSess.Table("iac_resource as r").
+		Joins("left join iac_resource_drift as rd on rd.res_id =  r.id ").
+		Where("r.org_id = ? AND r.project_id = ? AND r.env_id = ? AND r.task_id = ?",
+			task.OrgId, task.ProjectId, task.EnvId, task.Id).
+		LazySelectAppend("r.*, rd.drift_detail, rd.updated_at, rd.created_at").
+		Find(&rs); err != nil {
+		return nil, e.New(e.DBError, err)
+	}
+
+	return rs, nil
+}
+
+func InsertOrUpdateCronTaskInfo(session *db.Session, resDrift models.ResourceDrift) {
+	dbResDrift := models.ResourceDrift{}
+	if err := session.Where("res_id = ?", resDrift.ResId).Find(&dbResDrift); err != nil {
+		logs.Get().Errorf("insert resource drift info error: %v", err)
+		return
+	}
+
+	if dbResDrift.Id == "" {
+		if err := models.Create(session, &resDrift); err != nil {
+			logs.Get().Errorf("insert resource drift info error: %v", err)
+		}
+	} else {
+		dbResDrift.DriftDetail = resDrift.DriftDetail
+		if _, err := models.UpdateModelAll(session, &dbResDrift); err != nil {
+			logs.Get().Errorf("update resource drift info error: %v", err)
+		}
+	}
+}
+
+func SendVcsComment(session *db.Session, task *models.Task, taskStatus string) {
+	env, er := GetEnvById(session, task.EnvId)
+	if er != nil {
+		logs.Get().Errorf("vcs comment err, get env detail data err: %v", er)
+		return
+	}
+
+	vp, err := GetVcsPrByTaskId(session, task)
+	if err != nil {
+		if !e.IsRecordNotFound(err) {
+			logs.Get().Errorf("vcs comment err, get vcs pr data err: %v", err)
+		}
+		return
+	}
+
+	vcs, er := GetVcsRepoByTplId(session, task.TplId)
+	if err != nil {
+		logs.Get().Errorf("vcs comment err, get vcs data err: %v", er)
+		return
+	}
+	taskStep, er := GetTaskPlanStep(session, task.Id)
+	if er != nil {
+		logs.Get().Errorf("vcs comment err, get task step data err: %v", er)
+		return
+	}
+
+	logContent, err := logstorage.Get().Read(taskStep.LogPath)
+	if err != nil {
+		logs.Get().Errorf("vcs comment err, get task plan log err: %v", err)
+		return
+	}
+
+	attr := map[string]interface{}{
+		"Status": taskStatus,
+		"Name":   env.Name,
+		//http://{{addr}}/org/{{orgId}}/project/{{ProjectId}}/m-project-env/detail/{{envId}}/task/{{TaskId}}
+		"Addr":    fmt.Sprintf("%s/org/%s/project/%s/m-project-env/detail/%s/task/%s", configs.Get().Portal.Address, task.OrgId, task.ProjectId, task.EnvId, task.Id),
+		"Content": stripansi.Strip(string(logContent)),
+	}
+
+	content := utils.SprintTemplate(consts.PrCommentTpl, attr)
+	if err := vcs.CreatePrComment(vp.PrId, content); err != nil {
+		logs.Get().Errorf("vcs comment err, create comment err: %v", err)
+		return
+	}
+}
+
+func QueryResource(dbSess *db.Session, task *models.Task) *db.Session {
+	return dbSess.Table("iac_resource as r").
+		Joins("inner join iac_resource_drift as rd on rd.address =  r.address  and rd.env_id = ? ", task.EnvId).
+		Where("r.org_id = ? AND r.project_id = ? AND r.env_id = ? AND r.task_id = ?",
+			task.OrgId, task.ProjectId, task.EnvId, task.Id)
+}
+
+func GetDriftResource(session *db.Session, envId, driftTaskId models.Id) ([]models.ResourceDrift, e.Error) {
+	driftResources := make([]models.ResourceDrift, 0)
+	if err := session.Model(&models.ResourceDrift{}).
+		Where("env_id = ?", envId).
+		Where("task_id = ?", driftTaskId).
+		Find(&driftResources); err != nil {
+		return nil, e.New(e.DBError, err)
+	}
+	return driftResources, nil
+}
+
+type ResourceDriftResp struct {
+	models.ResourceDrift
+	IsDrift bool `gorm:"-" json:"isDrift"`
+}
+
+func GetDriftResourceById(session *db.Session, id string) (*ResourceDriftResp, e.Error) {
+	driftResources := &ResourceDriftResp{}
+	if err := session.Model(&models.ResourceDrift{}).
+		Where("id = ?", id).
+		First(driftResources); err != nil {
+		return nil, e.New(e.DBError, err)
+	}
+	driftResources.IsDrift = true
+	return driftResources, nil
 }

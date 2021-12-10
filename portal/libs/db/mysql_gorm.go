@@ -63,6 +63,14 @@ func (s *Session) New() *Session {
 	return ToSess(s.db.Session(&gorm.Session{NewDB: true}))
 }
 
+func (s *Session) DropTable(table string) error {
+	migrator := s.db.Migrator()
+	if !migrator.HasTable(table) {
+		return nil
+	}
+	return migrator.DropTable(table)
+}
+
 func (s *Session) AddUniqueIndex(indexName string, columns ...string) error {
 	stmt := s.db.Statement
 	if stmt.Model != nil {
@@ -198,6 +206,10 @@ func (s *Session) Select(query interface{}, args ...interface{}) *Session {
 	return ToSess(s.db.Select(query, args...))
 }
 
+func (s *Session) Omit(cols ...string) *Session {
+	return ToSess(s.db.Omit(cols...))
+}
+
 func (s *Session) LazySelect(selectStat ...string) *Session {
 	return ToSess(s.db.Set("app:lazySelects", selectStat))
 }
@@ -270,11 +282,13 @@ func (s *Session) autoLazySelect() *Session {
 	return s.Select(strings.Join(selects.([]string), ","))
 }
 
+// 获取查询到的第一条记录，按主键排序，如果指定了 Order() 则联合主键一起排序
 func (s *Session) First(out interface{}) error {
 	qs := s.autoLazySelect()
 	return qs.db.First(out).Error
 }
 
+// 获取查询到的最后一条记录，按主键排序，如果指定了 Order() 则联合主键一起排序
 func (s *Session) Last(out interface{}) error {
 	qs := s.autoLazySelect()
 	return qs.db.Last(out).Error
@@ -307,6 +321,11 @@ func (s *Session) isModel(m interface{}) bool {
 		rv = rv.Elem()
 	}
 	return rv.Kind() == reflect.Struct
+}
+
+func (s *Session) IsOrdered() bool {
+	_, ok := s.db.Statement.Clauses[clause.OrderBy{}.Name()]
+	return ok
 }
 
 func (s *Session) Update(value interface{}) (int64, error) {

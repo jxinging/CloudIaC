@@ -4,21 +4,27 @@ package runner
 
 import (
 	"context"
+	"fmt"
+	"io/ioutil"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
+	"github.com/pkg/errors"
 
 	"cloudiac/common"
 	"cloudiac/configs"
 	"cloudiac/utils"
 )
 
-// Command to run docker image
-type Command struct {
+// Task Executor
+type Executor struct {
 	Image      string
+	Name       string
 	Env        []string
 	Timeout    int
 	PrivateKey string
@@ -27,6 +33,7 @@ type Command struct {
 	Commands         []string
 	HostWorkdir      string // 宿主机目录
 	Workdir          string // 容器目录
+	AutoRemove       bool   // 开启容器的自动删除？
 	// for container
 	//ContainerInstance *Container
 }
@@ -38,20 +45,62 @@ type Container struct {
 	RunID   string
 }
 
-func (cmd *Command) Start() (string, error) {
-	logger := logger.WithField("taskId", filepath.Base(cmd.HostWorkdir))
-	cli, err := client.NewClientWithOpts()
+func DockerClient() (*client.Client, error) {
+	return dockerClient()
+}
+
+func dockerClient() (*client.Client, error) {
+	cli, err := client.NewClientWithOpts(
+		client.FromEnv,
+		client.WithAPIVersionNegotiation(),
+	)
 	if err != nil {
-		logger.Errorf("unable to create docker client")
+		return nil, errors.Wrap(err, "create docker client")
+	}
+	return cli, nil
+}
+
+func (exec *Executor) tryPullImage(cli *client.Client) {
+	logger := logger.WithField("image", exec.Image).WithField("action", "TryPullImage")
+	if cli == nil {
+		var err error
+		cli, err = dockerClient()
+		if err != nil {
+			logger.Warn(err)
+			return
+		}
+	}
+
+	reader, err := cli.ImagePull(context.Background(), exec.Image, types.ImagePullOptions{})
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			logger.Debugf("pull image: %v", err)
+		} else {
+			logger.Warnf("pull image: %v", err)
+		}
+		return
+	}
+	defer reader.Close()
+
+	bs, _ := ioutil.ReadAll(reader)
+	logger.Tracef("pull image: %s", bs)
+}
+
+func (exec *Executor) Start() (string, error) {
+	logger := logger.WithField("taskId", filepath.Base(exec.HostWorkdir))
+	cli, err := dockerClient()
+	if err != nil {
+		logger.Error(err)
 		return "", err
 	}
-	cli.NegotiateAPIVersion(context.Background())
+	logger.Infof("pull image: %s", exec.Image)
+	exec.tryPullImage(cli)
 
 	conf := configs.Get()
 	mountConfigs := []mount.Mount{
 		{
 			Type:   mount.TypeBind,
-			Source: cmd.HostWorkdir,
+			Source: exec.HostWorkdir,
 			Target: ContainerWorkspace,
 		},
 		{
@@ -89,7 +138,7 @@ func (cmd *Command) Start() (string, error) {
 	// 注意，该方案有个问题：客户无法自定义镜像预先安装需要的 terraform 版本，
 	// 因为判断版本不在 TerraformVersions 列表中就会挂载目录，客户自定义镜像安装的版本会被覆盖
 	//（考虑把版本列表写到配置文件？）
-	if !utils.StrInArray(cmd.TerraformVersion, common.TerraformVersions...) {
+	if !utils.StrInArray(exec.TerraformVersion, common.TerraformVersions...) {
 		mountConfigs = append(mountConfigs, mount.Mount{
 			Type:   mount.TypeBind,
 			Source: conf.Runner.AbsTfenvVersionsCachePath(),
@@ -100,21 +149,23 @@ func (cmd *Command) Start() (string, error) {
 	c, err := cli.ContainerCreate(
 		context.Background(),
 		&container.Config{
-			Image:        cmd.Image,
-			WorkingDir:   cmd.Workdir,
-			Cmd:          cmd.Commands,
-			Env:          cmd.Env,
+			Image:        exec.Image,
+			WorkingDir:   exec.Workdir,
+			Cmd:          exec.Commands,
+			Env:          exec.Env,
+			OpenStdin:    true,
+			Tty:          true,
 			AttachStdin:  false,
 			AttachStdout: true,
 			AttachStderr: true,
 		},
 		&container.HostConfig{
-			AutoRemove: false,
+			AutoRemove: exec.AutoRemove,
 			Mounts:     mountConfigs,
 		},
 		nil,
 		nil,
-		"")
+		exec.Name)
 	if err != nil {
 		logger.Errorf("create container err: %v", err)
 		return "", err
@@ -124,4 +175,163 @@ func (cmd *Command) Start() (string, error) {
 	logger.Infof("container id: %s", cid)
 	err = cli.ContainerStart(context.Background(), c.ID, types.ContainerStartOptions{})
 	return cid, err
+}
+
+func (Executor) RunCommand(cid string, command []string) (execId string, err error) {
+	cli, err := dockerClient()
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := cli.ContainerExecCreate(context.Background(), cid, types.ExecConfig{
+		Detach: false,
+		Cmd:    command,
+	})
+	if err != nil {
+		err = errors.Wrap(err, "container exec create")
+		return "", err
+	}
+
+	err = cli.ContainerExecStart(context.Background(), resp.ID, types.ExecStartCheck{})
+	if err != nil {
+		err = errors.Wrap(err, "container exec start")
+		return "", err
+	}
+
+	return resp.ID, nil
+}
+
+func (Executor) GetExecInfo(execId string) (execInfo types.ContainerExecInspect, err error) {
+	cli, err := dockerClient()
+	if err != nil {
+		return execInfo, err
+	}
+	execInfo, err = cli.ContainerExecInspect(context.Background(), execId)
+	if err != nil {
+		return execInfo, errors.Wrap(err, "container exec attach")
+	}
+	return execInfo, nil
+}
+
+func (Executor) Wait(ctx context.Context, cid string) error {
+	cli, err := dockerClient()
+	if err != nil {
+		return err
+	}
+
+	okCh, errCh := cli.ContainerWait(ctx, cid, container.WaitConditionNotRunning)
+	select {
+	case <-okCh:
+		return nil
+	case err = <-errCh:
+		return err
+	}
+}
+
+func (Executor) WaitCommand(ctx context.Context, execId string) (execInfo types.ContainerExecInspect, err error) {
+	cli, err := dockerClient()
+	if err != nil {
+		return execInfo, err
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return execInfo, ctx.Err()
+		default:
+		}
+
+		inspect, err := cli.ContainerExecInspect(ctx, execId)
+		if err != nil {
+			if err == context.DeadlineExceeded {
+				return execInfo, err
+			}
+			return execInfo, errors.Wrap(err, "container exec inspect")
+		}
+		if !inspect.Running {
+			return execInfo, nil
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func (exec Executor) WaitCommandWithDeadline(ctx context.Context, execId string, deadline time.Time) (execInfo types.ContainerExecInspect, err error) {
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	logger.Debugf("wait exec %s, deadline: %s", execId, deadline.Format(time.RFC3339))
+	if execInfo, err = exec.WaitCommand(ctx, execId); err != nil {
+		if err == context.DeadlineExceeded {
+			// logger.Infof("task %s/step%s: %v", exec..TaskId, t.req.Step, err)
+			if err := (Executor{}).StopCommand(execId); err != nil {
+				logger.WithField("cid", execInfo.ContainerID).Errorf("stop command error: %v", err)
+			}
+		}
+		return execInfo, err
+	}
+
+	return execInfo, err
+}
+
+func (e Executor) StopCommand(execId string) (err error) {
+	cli, err := dockerClient()
+	if err != nil {
+		return err
+	}
+
+	inspect, err := cli.ContainerExecInspect(context.Background(), execId)
+	if err != nil {
+		return errors.Wrap(err, "container exec attach")
+	}
+
+	if _, err := e.RunCommand(inspect.ContainerID, []string{"kill", "-9", fmt.Sprintf("%d", inspect.Pid)}); err != nil {
+		return errors.Wrap(err, "kill process")
+	}
+	return nil
+}
+
+func (Executor) IsPaused(cid string) (bool, error) {
+	cli, err := dockerClient()
+	if err != nil {
+		return false, err
+	}
+
+	inspect, err := cli.ContainerInspect(context.Background(), cid)
+	if err != nil {
+		return false, errors.Wrapf(err, "%s, container inspect", cid)
+	}
+
+	return inspect.State.Paused, nil
+}
+
+func (Executor) Pause(cid string) (err error) {
+	cli, err := dockerClient()
+	if err != nil {
+		return err
+	}
+
+	if err := cli.ContainerPause(context.Background(), cid); err != nil {
+		if strings.Contains(err.Error(), "is not running") ||
+			strings.Contains(err.Error(), "is already paused") {
+			return nil
+		}
+		err = errors.Wrapf(err, "pause container %s", cid)
+		return err
+	}
+
+	return nil
+}
+
+func (Executor) Unpause(cid string) (err error) {
+	cli, err := dockerClient()
+	if err != nil {
+		return err
+	}
+
+	if err := cli.ContainerUnpause(context.Background(), cid); err != nil {
+		err = errors.Wrapf(err, "unpause container %s", cid)
+		return err
+	}
+	return nil
 }

@@ -12,7 +12,6 @@ const (
 	*/
 
 	// 通用错误 1
-
 	InternalError           = 10000
 	ObjectAlreadyExists     = 10010
 	ObjectNotExists         = 10011
@@ -20,14 +19,15 @@ const (
 	ObjectDisabled          = 10014
 	NotImplement            = 10020
 	IOError                 = 10030 // 文件 io 出错
+	TooManyRetries          = 10040
+	EncryptError            = 10050
+	DecryptError            = 10051
 
 	//// 解析错误 101
-
 	JSONParseError = 10100
 	HCLParseError  = 10101
 
 	//// db 错误 102
-
 	DBError           = 10200 // db 操作出错
 	DBAttrValidateErr = 10201
 	ColValidateError  = 10202
@@ -40,23 +40,34 @@ const (
 	TagTooMuch        = 10215
 
 	//// 校验错误 103
-
+	BadOrgId               = 10310
+	BadProjectId           = 10311
+	BadTemplateId          = 10312
+	BadEnvId               = 10314
 	BadParam               = 10340 // 参数错误(参数值不对)
 	BadRequest             = 10341 // 请求错误(请求缺少必要参数)
+	InvalidPipeline        = 10350
+	InvalidPipelineVersion = 10351
+	InvalidExportVersion   = 10361
 	InvalidAccessKeyId     = 10380 // AccessKeyId错误
 	InvalidAccessKeySecret = 10381
 	ForbiddenAccessKey     = 10382
+	TemplateNameRepeat     = 10383
+	TemplateWorkdirError   = 10384
 
 	//// 第三方服务错误 104
-
 	LdapError       = 10410 // ldap 出错
 	MailServerError = 10420
 	ConsulConnError = 10430
 	VcsError        = 10440
 
+	//// 导入导出错误 105
+	ImportError       = 10510
+	ImportIdDuplicate = 10520 //  id 重复
+	ImportUpdateOrgId = 10530
+
 	// 权限认证 2
 	//// 认证 200
-
 	InvalidPassword   = 20010
 	InvalidToken      = 20000 // 无效 token
 	InvalidTokenScope = 20001 // 无效 token scope
@@ -65,14 +76,13 @@ const (
 	InvalidProjectId  = 20007 // 无效的 projectId
 
 	//// 权限 201
-
 	PermissionDeny   = 20110
 	ValidateError    = 20111
 	InvalidOperation = 20112
+	PermDenyApproval = 20113
 
 	// 功能模块 3
 	//// 用户 301
-
 	UserAlreadyExists          = 30110
 	UserNotExists              = 30120
 	UserEmailDuplicate         = 30130
@@ -86,7 +96,6 @@ const (
 	RoleNameDuplicate          = 30151
 
 	//// 组织 303
-
 	OrganizationAlreadyExists = 30310
 	OrganizationNotExists     = 30311
 	OrganizationDisabled      = 30312
@@ -94,7 +103,6 @@ const (
 	InvalidOrganizationId     = 30315
 
 	//// project 304
-
 	ProjectAlreadyExists      = 30410
 	ProjectNotExists          = 30411
 	ProjectAliasDuplicate     = 30412
@@ -102,34 +110,34 @@ const (
 	ProjectUserAliasDuplicate = 30421
 
 	//// variable 305
-
 	VariableAlreadyExists  = 30510
 	VariableAliasDuplicate = 30511
+	VariableScopeConflict  = 30512
+	InvalidVarName         = 30513
+	EmptyVarName           = 30514
+	EmptyVarValue          = 30515
 
 	//// token 306
-
 	TokenAlreadyExists  = 30610
 	TokenNotExists      = 30611
 	TokenAliasDuplicate = 30613
 
 	//// template 307
-
 	TemplateAlreadyExists   = 30710
 	TemplateNotExists       = 30711
 	TemplateDisabled        = 30712
 	TemplateActiveEnvExists = 30730
 
 	//// environment 308
-
 	EnvAlreadyExists       = 30810
 	EnvNotExists           = 30811
 	EnvAliasDuplicate      = 30812
 	EnvArchived            = 30813
 	EnvCannotArchiveActive = 30814
 	EnvDeploying           = 30815
+	EnvCheckAutoApproval   = 30816
 
 	//// task 309
-
 	TaskAlreadyExists     = 30910
 	TaskNotExists         = 30911
 	TaskApproveNotPending = 30913
@@ -137,19 +145,16 @@ const (
 	TaskNotHaveStep       = 30916
 
 	//// ssh key 310
-
 	KeyAlreadyExists  = 31010
 	KeyNotExist       = 31011
 	KeyAliasDuplicate = 31012
 	KeyDecryptFail    = 31013
 
 	//// vcs 311
-
 	VcsNotExists   = 31110
 	VcsDeleteError = 31120
 
 	//// policy 312
-
 	PolicyAlreadyExist           = 31210
 	PolicyNotExist               = 31211
 	PolicyGroupAlreadyExist      = 31221
@@ -164,9 +169,19 @@ const (
 	PolicyRelNotExist            = 31270
 	PolicyRelAlreadyExist        = 31271
 	PolicyScanNotEnabled         = 31280
-	/// terraform 313
 
+	/// terraform 313
 	InvalidTfVersion = 31300
+
+	// VariableGroup 314
+
+	VariableGroupAlreadyExist   = 31410
+	VariableGroupNotExist       = 31411
+	VariableGroupAliasDuplicate = 31412
+
+	//cron 315
+	CronExpressError = 31500
+	CronTaskFailed   = 31501
 )
 
 var errorMsgs = map[int]map[string]string{
@@ -197,11 +212,38 @@ var errorMsgs = map[int]map[string]string{
 	DBAttrValidateErr: {
 		"zh-cn": "字段验证错误",
 	},
+	BadOrgId: {
+		"zh-cn": "组织 ID 错误",
+	},
+	BadProjectId: {
+		"zh-cn": "项目 ID 错误",
+	},
+	BadTemplateId: {
+		"zh-cn": "模板 ID 错误",
+	},
+	BadEnvId: {
+		"zh-cn": "环境 ID 错误",
+	},
 	BadParam: {
 		"zh-cn": "无效参数",
 	},
+	TemplateNameRepeat: {
+		"zh-cn": "云模版名称重复",
+	},
+	TemplateWorkdirError: {
+		"zh-cn": "工作目录校验失败",
+	},
 	BadRequest: {
 		"zh-cn": "无效请求",
+	},
+	InvalidPipeline: {
+		"zh-cn": "pipeline 格式错误",
+	},
+	InvalidPipelineVersion: {
+		"zh-cn": "不支持的 pipeline 版本",
+	},
+	InvalidExportVersion: {
+		"zh-cn": "不支持的导出数据版本",
 	},
 	DataTooLong: {
 		"zh-cn": "内容过长",
@@ -220,6 +262,15 @@ var errorMsgs = map[int]map[string]string{
 	},
 	IOError: {
 		"zh-cn": "io 错误",
+	},
+	TooManyRetries: {
+		"zh-cn": "达到最大重试次数",
+	},
+	EncryptError: {
+		"zh-cn": "数据加密错误",
+	},
+	DecryptError: {
+		"zh-cn": "数据解密错误",
 	},
 	MailServerError: {
 		"zh-cn": "邮件服务错误",
@@ -293,6 +344,9 @@ var errorMsgs = map[int]map[string]string{
 	PermissionDeny: {
 		"zh-cn": "无权限",
 	},
+	PermDenyApproval: {
+		"zh-cn": "无审批权限",
+	},
 	ValidateError: {
 		"zh-cn": "验证失败",
 	},
@@ -330,10 +384,24 @@ var errorMsgs = map[int]map[string]string{
 		"zh-cn": "模板语法解析错误",
 	},
 
+	VariableAlreadyExists: {
+		"zh-cn": "变量已存在",
+	},
 	VariableAliasDuplicate: {
 		"zh-cn": "变量别名重复",
 	},
-
+	VariableScopeConflict: {
+		"zh-cn": "变量作用域冲突",
+	},
+	InvalidVarName: {
+		"zh-cn": "无效变量名",
+	},
+	EmptyVarName: {
+		"zh-cn": "变量名不可为空",
+	},
+	EmptyVarValue: {
+		"zh-cn": "变量值不可为空",
+	},
 	ProjectUserAlreadyExists: {
 		"zh-cn": "项目用户已经存在",
 	},
@@ -379,6 +447,9 @@ var errorMsgs = map[int]map[string]string{
 	EnvDeploying: {
 		"zh-cn": "环境正在部署中，请不要重复发起",
 	},
+	EnvCheckAutoApproval: {
+		"zh-cn": "配置自动纠漂移、推送到分支时重新部署时，必须配置自动审批",
+	},
 	TaskAlreadyExists: {
 		"zh-cn": "任务已经存在",
 	},
@@ -393,6 +464,15 @@ var errorMsgs = map[int]map[string]string{
 	},
 	VcsDeleteError: {
 		"zh-cn": "vcs存在相关依赖云模版，无法删除",
+	},
+	ImportError: {
+		"zh-cn": "导入出错",
+	},
+	ImportIdDuplicate: {
+		"zh-cn": "id 重复",
+	},
+	ImportUpdateOrgId: {
+		"zh-cn": "同 id 的数据己属于另一组织，无法使用“覆盖”方案(不允许更改组织 id)",
 	},
 	TaskApproveNotPending: {
 		"zh-cn": "作业状态非待审批，不允许操作",
@@ -470,5 +550,11 @@ var errorMsgs = map[int]map[string]string{
 
 	PolicyScanNotEnabled: {
 		"zh-cn": "扫描未启用",
+	},
+	CronExpressError: {
+		"zh-cn": "cron定时任务表达式错误",
+	},
+	CronTaskFailed: {
+		"zh-cn": "cron定时任务执行失败",
 	},
 }

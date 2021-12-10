@@ -4,4 +4,12 @@ package common
 
 var (
 	DemoOrgId string
+
+	TaskJobTypes = []string{
+		TaskJobPlan,
+		TaskJobApply,
+		TaskJobDestroy,
+		TaskJobScan,
+		TaskJobParse,
+	}
 )

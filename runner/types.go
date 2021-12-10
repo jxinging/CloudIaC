@@ -39,7 +39,10 @@ type RunTaskReq struct {
 	DockerImage  string     `json:"dockerImage"`
 	StateStore   StateStore `json:"stateStore" binding:""`
 	RepoAddress  string     `json:"repoAddress" binding:""` // 带 token 的完整路径
-	RepoRevision string     `json:"repoRevision" binding:""`
+	RepoBranch   string     `json:"repoBranch" binding:""`  // git branch or tag
+	RepoCommitId string     `json:"repoCommitId" binding:""`
+
+	SysEnvironments map[string]string `json:"sysEnvironments "` // 系统注入的环境变量
 
 	Timeout    int    `json:"timeout"`
 	PrivateKey string `json:"privateKey"`
@@ -48,6 +51,9 @@ type RunTaskReq struct {
 	StopOnViolation bool         `json:"stopOnViolation"`
 
 	Repos []Repository `json:"repos"` // 待扫描仓库列表
+
+	ContainerId string `json:"containerId"`
+	PauseTask   bool   `json:"pauseTask"` // 本次执行结束后暂停任务
 }
 
 type Repository struct {
@@ -61,6 +67,11 @@ type TaskStatusReq struct {
 	Step   int    `json:"step" form:"step" binding:""`
 }
 
+type TaskStopReq struct {
+	TaskId       string   `json:"taskId" form:"taskId" binding:"required"`
+	ContainerIds []string `json:"containerIds" form:"containerIds" binding:"required"`
+}
+
 type TaskPolicy struct {
 	PolicyId string      `json:"policyId"`
 	Meta     interface{} `json:"meta"`
@@ -71,6 +82,9 @@ type TaskLogReq TaskStatusReq
 
 // TaskStatusMessage runner 通知任务状态到 portal
 type TaskStatusMessage struct {
+	Timeout bool `json:"timeout"` // 任务是否己超时？
+
+	// 当 timeout 为 true 时，以下两个字段无意义
 	Exited   bool `json:"exited"`
 	ExitCode int  `json:"status_code"`
 

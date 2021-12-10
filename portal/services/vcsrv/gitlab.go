@@ -8,6 +8,7 @@ import (
 	"cloudiac/utils"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/xanzy/go-gitlab"
@@ -143,13 +144,13 @@ func (git *gitlabRepoIface) ListFiles(option VcsIfaceOptions) ([]string, error) 
 
 }
 
-func (git *gitlabRepoIface) ReadFileContent(branch, path string) (content []byte, err error) {
+func (git *gitlabRepoIface) ReadFileContent(branch, path string) ([]byte, error) {
 	opt := &gitlab.GetRawFileOptions{Ref: gitlab.String(branch)}
-	row, _, errs := git.gitConn.RepositoryFiles.GetRawFile(git.Project.ID, path, opt)
-	if errs != nil {
-		return content, e.New(e.VcsError, err)
+	row, _, err := git.gitConn.RepositoryFiles.GetRawFile(git.Project.ID, path, opt)
+	if err != nil && strings.Contains(err.Error(), "File Not Found") {
+		return nil, e.New(e.ObjectNotExists, err)
 	}
-	return row, nil
+	return row, err
 }
 
 type Projects struct {
@@ -226,10 +227,21 @@ func (git *gitlabRepoIface) DeleteWebhook(id int) error {
 	return err
 }
 
-func GetGitConn(gitlabToken, gitlabUrl string) (git *gitlab.Client, err e.Error) {
-	git, er := gitlab.NewClient(gitlabToken, gitlab.WithBaseURL(gitlabUrl+"/api/v4"))
+func (git *gitlabRepoIface) CreatePrComment(prId int, comment string) error {
+	if _, _, err := git.gitConn.Notes.CreateMergeRequestNote(git.Project.ID, prId, &gitlab.CreateMergeRequestNoteOptions{Body: gitlab.String(comment)}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func GetGitConn(gitlabToken, gitlabUrl string) (*gitlab.Client, e.Error) {
+	token, err := GetVcsToken(gitlabToken)
+	if err != nil {
+		return nil, e.New(e.VcsError, err)
+	}
+	git, er := gitlab.NewClient(token, gitlab.WithBaseURL(gitlabUrl+"/api/v4"))
 	if er != nil {
 		return nil, e.New(e.JSONParseError, er)
 	}
-	return
+	return git, nil
 }

@@ -12,8 +12,15 @@ const (
 	TaskTypePlan    = "plan"    // 计划执行，不会修改资源或做服务配置
 	TaskTypeApply   = "apply"   // 执行 terraform apply 和 playbook
 	TaskTypeDestroy = "destroy" // 销毁，删除所有资源
-	TaskTypeScan    = "scan"    // 策略扫描，只执行策略扫描，不锈钢资源或配置
-	TaskTypeParse   = "parse"   // 策略扫描，只执行策略扫描，不锈钢资源或配置
+	TaskTypeScan    = "scan"    // 策略扫描，只执行策略扫描，不修改资源或配置
+	TaskTypeParse   = "parse"   // 策略扫描，只执行策略扫描，不修改资源或配置
+
+	// TODO 与 taskTypexxx 重复，需要替换
+	TaskJobPlan    = "plan"
+	TaskJobApply   = "apply"
+	TaskJobDestroy = "destroy"
+	TaskJobScan    = "scan"
+	TaskJobParse   = "parse"
 
 	TaskPending   = "pending"
 	TaskRunning   = "running"
@@ -22,17 +29,24 @@ const (
 	TaskFailed    = "failed"
 	TaskComplete  = "complete"
 
-	TaskStepInit     = "init"
-	TaskStepPlan     = "plan"
-	TaskStepApply    = "apply"
-	TaskStepDestroy  = "destroy"
-	TaskStepPlay     = "play"    // play playbook
-	TaskStepCommand  = "command" // run command
-	TaskStepCollect  = "collect" // 任务结束后的信息采集
-	TaskStepScanInit = "scaninit"
-	TaskStepTfParse  = "tfparse" // 云模板解析
-	TaskStepTfScan   = "tfscan"  // 云模板策略扫描
+	TaskStepCheckout  = "checkout"
+	TaskStepTfInit    = "terraformInit"
+	TaskStepTfPlan    = "terraformPlan"
+	TaskStepTfApply   = "terraformApply"
+	TaskStepTfDestroy = "terraformDestroy"
 
+	TaskStepRegoParse = "regoParse" // 解析资源为 rego 的 input
+	TaskStepOpaScan   = "opaScan"   // 云模板策略扫描
+
+	TaskStepAnsiblePlay = "ansiblePlay" // play playbook
+	TaskStepCommand     = "command"     // run command
+	TaskStepCollect     = "collect"     // 任务结束后的信息采集
+	TaskStepScanInit    = "scaninit"
+	CronDriftTaskName   = "Drift Detection" // 漂移检测任务名称
+
+	PipelineFileName = ".cloudiac-pipeline.yml"
+
+	// 结束采集步骤的索引
 	CollectTaskStepIndex = -1
 
 	TaskStepPending   = "pending"
@@ -50,7 +64,8 @@ const (
 	TaskTypeDestroyName = "destroy"
 	TaskTypeScanName    = "scan"
 
-	TaskStepTimeoutDuration = 600
+	// 默认步骤超时时间(秒)
+	DefaultTaskStepTimeout = 1800
 
 	VcsGitlab = "gitlab"
 	VcsGitea  = "gitea"

@@ -12,11 +12,12 @@ import (
 	"cloudiac/portal/consts/e"
 	"cloudiac/utils/logs"
 	"fmt"
-	"github.com/go-git/go-git/v5/plumbing/storer"
 	"io/fs"
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/go-git/go-git/v5/plumbing/storer"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -171,9 +172,12 @@ func (l *LocalRepo) ListFiles(opt VcsIfaceOptions) ([]string, error) {
 			return nil
 		}
 
-		// 非递归时只遍历第一层目录
-		if !opt.Recursive && (opt.Path != "" && filepath.Dir(file.Name) != opt.Path) {
-			return nil
+		if !opt.Recursive {
+			// 非递归时只遍历第一层目录
+			if (opt.Path == "" && filepath.Dir(file.Name) != ".") ||
+				(opt.Path != "" && filepath.Dir(file.Name) != opt.Path) {
+				return nil
+			}
 		}
 
 		if matchGlob(opt.Search, filepath.Base(file.Name)) {
@@ -200,6 +204,9 @@ func (l *LocalRepo) ReadFileContent(revision string, path string) (content []byt
 
 	file, err := commit.File(path)
 	if err != nil {
+		if strings.Contains(err.Error(), "file not found") {
+			return nil, e.New(e.ObjectNotExists)
+		}
 		return nil, err
 	}
 
@@ -248,5 +255,10 @@ func (l *LocalRepo) ListWebhook() ([]ProjectsHook, error) {
 }
 
 func (l *LocalRepo) DeleteWebhook(id int) error {
+	return nil
+}
+
+func (l *LocalRepo) CreatePrComment(prId int,comment string) error {
+
 	return nil
 }

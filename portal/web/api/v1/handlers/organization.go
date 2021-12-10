@@ -187,7 +187,7 @@ func (Organization) UpdateUserOrgRel(c *ctx.GinRequest) {
 	c.JSONResult(apps.UpdateUserOrgRel(c.Service(), &form))
 }
 
-/**
+
 // SearchUser 查询组织用户列表
 // @Tags 用户
 // @Summary 用户查询
@@ -199,7 +199,6 @@ func (Organization) UpdateUserOrgRel(c *ctx.GinRequest) {
 // @Param form query forms.SearchUserForm true "parameter"
 // @router /orgs/{orgId}/users [get]
 // @Success 200 {object} ctx.JSONResult{result=page.PageResp{list=[]models.User}}
-*/
 func (Organization) SearchUser(c *ctx.GinRequest) {
 	form := forms.SearchUserForm{}
 	if err := c.Bind(&form); err != nil {
@@ -228,4 +227,43 @@ func (Organization) InviteUser(c *ctx.GinRequest) {
 		return
 	}
 	c.JSONResult(apps.InviteUser(c.Service(), &form))
+}
+
+//SearchOrgResources 搜索当前组织下所有项目的活跃资源列表
+//@Tags 组织
+//@Summary 搜索当前组织下所有项目的活跃资源列表
+//@Accept application/x-www-form-urlencoded
+//@Produce json
+//@Security AuthToken
+//@Param IaC-Org-Id header string true "组织ID"
+//@Param form query forms.SearchOrgResourceForm true "parameter"
+//@router /orgs/resources [get]
+//@Success 200 {object} ctx.JSONResult{result=apps.OrgResourcesResp}
+func (Organization) SearchOrgResources(c *ctx.GinRequest) {
+	form := forms.SearchOrgResourceForm{}
+	if err := c.Bind(&form); err != nil {
+		return
+	}
+	c.JSONResult(apps.SearchOrgResources(c.Service(), &form))
+}
+
+// UpdateUserOrg 编辑组织用户信息
+// @Tags 组织
+// @Summary 编辑组织用户信息
+// @Description 修改用户在组织中的角色。操作人需要拥有组织管理权限。
+// @Accept multipart/form-data
+// @Accept json
+// @Produce json
+// @Security AuthToken
+// @Param orgId path string true "组织ID"
+// @Param userId path string true "用户ID"
+// @Param form formData forms.UpdateUserOrgForm true "parameter"
+// @router /orgs/{orgId}/users/{userId} [put]
+// @Success 200 {object} ctx.JSONResult{result=models.UserWithRoleResp}
+func (Organization) UpdateUserOrg(c *ctx.GinRequest) {
+	form := forms.UpdateUserOrgForm{}
+	if err := c.Bind(&form); err != nil {
+		return
+	}
+	c.JSONResult(apps.UpdateUserOrg(c.Service(), &form))
 }

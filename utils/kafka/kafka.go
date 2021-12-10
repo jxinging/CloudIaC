@@ -4,6 +4,7 @@ package kafka
 
 import (
 	"cloudiac/configs"
+	"cloudiac/portal/models"
 	"cloudiac/utils/logs"
 	"encoding/json"
 	"fmt"
@@ -21,16 +22,31 @@ type KafkaProducer struct {
 var kafka *KafkaProducer
 
 type IacKafkaCallbackResult struct {
-	TaskStatus string `json:"taskStatus" form:"taskStatus" `
+	Resources []models.Resource `json:"resources"  `
 }
 
 type IacKafkaContent struct {
-	TransactionId string                 `json:"transactionId"`
-	Result        IacKafkaCallbackResult `json:"result"`
+	ExtraData  models.JSON            `json:"extraData"`
+	TaskStatus string                 `json:"taskStatus"`
+	OrgId      models.Id              `json:"orgId"`
+	ProjectId  models.Id              `json:"projectId"`
+	TplId      models.Id              `json:"tplId"`
+	EnvId      models.Id              `json:"envId"`
+	Result     IacKafkaCallbackResult `json:"result"`
 }
 
-func (k *KafkaProducer) GenerateKafkaContent(transactionId, result string) []byte {
-	a := IacKafkaContent{transactionId, IacKafkaCallbackResult{TaskStatus: result}}
+func (k *KafkaProducer) GenerateKafkaContent(task *models.Task, taskStatus string, resources []models.Resource) []byte {
+	a := IacKafkaContent{
+		ExtraData:  task.ExtraData,
+		TaskStatus: taskStatus,
+		OrgId:      task.OrgId,
+		ProjectId:  task.ProjectId,
+		TplId:      task.TplId,
+		EnvId:      task.EnvId,
+		Result: IacKafkaCallbackResult{
+			Resources: resources,
+		},
+	}
 	rep, _ := json.Marshal(&a)
 	return rep
 }

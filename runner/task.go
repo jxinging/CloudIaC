@@ -9,12 +9,14 @@ import (
 	"cloudiac/portal/consts"
 	"cloudiac/utils"
 	"cloudiac/utils/logs"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
@@ -36,6 +38,23 @@ func NewTask(req RunTaskReq, logger logs.Logger) *Task {
 }
 
 func (t *Task) Run() (cid string, err error) {
+	if t.req.ContainerId == "" {
+		cid, err = t.start()
+		if err != nil {
+			return cid, err
+		}
+		t.req.ContainerId = cid
+	} else {
+		// 初始化 workspace 路径名称
+		t.workspace, err = t.initWorkspace()
+		if err != nil {
+			return "", errors.Wrap(err, "initial workspace")
+		}
+	}
+	return t.req.ContainerId, t.runStep()
+}
+
+func (t *Task) start() (cid string, err error) {
 	for _, vars := range []map[string]string{
 		t.req.Env.EnvironmentVars, t.req.Env.TerraformVars, t.req.Env.AnsibleVars} {
 		if err = t.decryptVariables(vars); err != nil {
@@ -55,15 +74,10 @@ func (t *Task) Run() (cid string, err error) {
 		return "", errors.Wrap(err, "initial workspace")
 	}
 
-	if err = t.genStepScript(); err != nil {
-		return cid, errors.Wrap(err, "generate step script")
-	}
-
 	conf := configs.Get().Runner
-	cmd := Command{
+	cmd := Executor{
 		Image:       conf.DefaultImage,
-		Env:         nil,
-		Commands:    nil,
+		Name:        t.req.TaskId,
 		Timeout:     t.req.Timeout,
 		Workdir:     ContainerWorkspace,
 		HostWorkdir: t.workspace,
@@ -73,6 +87,17 @@ func (t *Task) Run() (cid string, err error) {
 		cmd.Image = t.req.DockerImage
 	}
 
+	reserveContainer := conf.ReserveContainer
+	if v, ok := t.req.Env.EnvironmentVars["CLOUDIAC_RESERVER_CONTAINER"]; ok {
+		// 需要明确判断是否为 true 或者 false，其他情况使用配置文件中的值
+		if utils.IsTrueStr(v) {
+			reserveContainer = true
+		} else if utils.IsFalseStr(v) {
+			reserveContainer = false
+		}
+	}
+	cmd.AutoRemove = !reserveContainer
+
 	tfPluginCacheDir := ""
 	for k, v := range t.req.Env.EnvironmentVars {
 		if k == "TF_PLUGIN_CACHE_DIR" {
@@ -80,9 +105,13 @@ func (t *Task) Run() (cid string, err error) {
 		}
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 	}
-
 	if tfPluginCacheDir == "" {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("TF_PLUGIN_CACHE_DIR=%s", ContainerPluginCachePath))
+	}
+
+	// 变量名冲突时，系统环境变量覆盖用户定义的环境变量
+	for k, v := range t.req.SysEnvironments {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 	}
 
 	for k, v := range t.req.Env.TerraformVars {
@@ -94,41 +123,105 @@ func (t *Task) Run() (cid string, err error) {
 	cmd.TerraformVersion = t.req.Env.TfVersion
 	cmd.Env = append(cmd.Env, fmt.Sprintf("TFENV_TERRAFORM_VERSION=%s", cmd.TerraformVersion))
 
-	shellArgs := " "
-	if utils.IsTrueStr(t.req.Env.EnvironmentVars["CLOUDIAC_DEBUG"]) {
-		shellArgs += "-x"
-	}
-	shellCommand := fmt.Sprintf("sh%s %s >>%s 2>&1",
-		shellArgs,
-		filepath.Join(t.stepDirName(t.req.Step), TaskStepScriptName),
-		filepath.Join(t.stepDirName(t.req.Step), TaskStepLogName),
-	)
-	cmd.Commands = []string{"sh", "-c", shellCommand}
+	// 容器启动后执行 /bin/bash 以保持运行，然后通过 exec 在容器中执行步骤命令
+	cmd.Commands = []string{"/bin/bash"}
 
-	stepDir := GetTaskStepDir(t.req.Env.Id, t.req.TaskId, t.req.Step)
-	containerInfoFile := filepath.Join(stepDir, TaskStepContainerInfoFileName)
+	stepDir := GetTaskDir(t.req.Env.Id, t.req.TaskId, t.req.Step)
+	containerInfoFile := filepath.Join(stepDir, TaskContainerInfoFileName)
 	// 启动容器前先删除可能存在的 containerInfoFile，以支持步骤重试，
-	// 否则 containerInfoFile 文件存在 CommittedTaskStep.Wait() 会直接返回
+	// 否则 containerInfoFile 文件存在 CommittedTask.Wait() 会直接返回
 	if err = os.Remove(containerInfoFile); err != nil && !os.IsNotExist(err) {
 		return "", errors.Wrap(err, "remove containerInfoFile")
 	}
 
-	t.logger.Infof("start task step, workdir: %s", cmd.HostWorkdir)
+	t.logger.Infof("start task step, %s", stepDir)
 	if cid, err = cmd.Start(); err != nil {
 		return cid, err
 	}
 
-	infoJson := utils.MustJSON(CommittedTaskStep{
-		EnvId:       t.req.Env.Id,
-		TaskId:      t.req.TaskId,
-		Step:        t.req.Step,
-		ContainerId: cid,
-	})
-	stepInfoFile := filepath.Join(stepDir, TaskStepInfoFileName)
-	if er := os.WriteFile(stepInfoFile, infoJson, 0644); er != nil {
-		logger.Errorln(er)
-	}
 	return cid, nil
+}
+
+func (t *Task) generateCommand(cmd string) []string {
+	cmds := []string{"/bin/sh"}
+	if utils.IsTrueStr(t.req.Env.EnvironmentVars["CLOUDIAC_DEBUG"]) {
+		cmds = append(cmds, "-x")
+	}
+	return append(cmds, "-c", cmd)
+}
+
+func (t *Task) runStep() (err error) {
+	_, err = t.genStepScript()
+	if err != nil {
+		return errors.Wrap(err, "generate step script")
+	}
+
+	containerScriptPath := filepath.Join(t.stepDirName(t.req.Step), TaskScriptName)
+	logPath := filepath.Join(t.stepDirName(t.req.Step), TaskLogName)
+
+	var command string
+	if utils.StrInArray(t.req.StepType, common.TaskStepCheckout, common.TaskStepScanInit) {
+		// 移除日志中可能出现的 token 信息
+		command = fmt.Sprintf("set -o pipefail\n%s 2>&1 | sed -re 's/token:[^@]+/token:******/' >>%s", containerScriptPath, logPath)
+	} else {
+		command = fmt.Sprintf("%s >>%s 2>&1", containerScriptPath, logPath)
+	}
+
+	if ok, err := (Executor{}).IsPaused(t.req.ContainerId); err != nil {
+		return err
+	} else if ok {
+		logger.Debugf("container %s is paused", t.req.ContainerId)
+
+		logger.Debugf("unpause container")
+		if err := (Executor{}).Unpause(t.req.ContainerId); err != nil {
+			return err
+		}
+		logger.Debugf("unpause container done")
+	}
+
+	execId, err := (&Executor{}).RunCommand(t.req.ContainerId, t.generateCommand(command))
+	if err != nil {
+		return err
+	}
+
+	now := time.Now()
+
+	// 后台协程监控到命令结束就会暂停容器，
+	// 同时 task.Wait() 函数也会在任务结束后暂停容器，两边同时处理保证容器被暂停
+	if t.req.PauseTask {
+		go func() {
+			_, err := (Executor{}).WaitCommand(context.Background(), execId)
+			if err != nil {
+				logger.Debugf("container %s: %v", t.req.ContainerId, err)
+				return
+			}
+
+			logger.Debugf("pause container %s", t.req.ContainerId)
+			if err := (&Executor{}).Pause(t.req.ContainerId); err != nil {
+				logger.Debugf("container %s: %v", t.req.ContainerId, err)
+			}
+		}()
+	}
+
+	infoJson := utils.MustJSON(StartedTask{
+		EnvId:         t.req.Env.Id,
+		TaskId:        t.req.TaskId,
+		Step:          t.req.Step,
+		ContainerId:   t.req.ContainerId,
+		PauseOnFinish: t.req.PauseTask,
+		ExecId:        execId,
+		StartedAt:     &now,
+		Timeout:       t.req.Timeout,
+	})
+	stepInfoFile := filepath.Join(
+		GetTaskDir(t.req.Env.Id, t.req.TaskId, t.req.Step),
+		TaskInfoFileName,
+	)
+	if err := os.WriteFile(stepInfoFile, infoJson, 0644); err != nil {
+		err = errors.Wrap(err, "write step info")
+		return err
+	}
+	return nil
 }
 
 func (t *Task) decryptVariables(vars map[string]string) error {
@@ -264,25 +357,27 @@ func (t *Task) executeTpl(tpl *template.Template, data interface{}) (string, err
 }
 
 func (t *Task) stepDirName(step int) string {
-	return GetTaskStepDirName(step)
+	return GetTaskDirName(step)
 }
 
-func (t *Task) genStepScript() error {
+func (t *Task) genStepScript() (string, error) {
 	var (
 		command string
 		err     error
 	)
 
 	switch t.req.StepType {
-	case common.TaskStepInit:
+	case common.TaskStepCheckout:
+		command, err = t.stepCheckout()
+	case common.TaskStepTfInit:
 		command, err = t.stepInit()
-	case common.TaskStepPlan:
+	case common.TaskStepTfPlan:
 		command, err = t.stepPlan()
-	case common.TaskStepApply:
+	case common.TaskStepTfApply:
 		command, err = t.stepApply()
-	case common.TaskStepDestroy:
+	case common.TaskStepTfDestroy:
 		command, err = t.stepDestroy()
-	case common.TaskStepPlay:
+	case common.TaskStepAnsiblePlay:
 		command, err = t.stepPlay()
 	case common.TaskStepCommand:
 		command, err = t.stepCommand()
@@ -290,41 +385,54 @@ func (t *Task) genStepScript() error {
 		command, err = t.collectCommand()
 	case common.TaskStepScanInit:
 		command, err = t.stepScanInit()
-	case common.TaskStepTfParse:
+	case common.TaskStepRegoParse:
 		command, err = t.stepTfParse()
-	case common.TaskStepTfScan:
+	case common.TaskStepOpaScan:
 		command, err = t.stepTfScan()
 	default:
-		return fmt.Errorf("unknown step type '%s'", t.req.StepType)
+		return "", fmt.Errorf("unknown step type '%s'", t.req.StepType)
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	stepDir := GetTaskStepDir(t.req.Env.Id, t.req.TaskId, t.req.Step)
+	stepDir := GetTaskDir(t.req.Env.Id, t.req.TaskId, t.req.Step)
 	if err = os.MkdirAll(stepDir, 0755); err != nil {
-		return err
+		return "", err
 	}
 
-	scriptPath := filepath.Join(stepDir, TaskStepScriptName)
+	scriptPath := filepath.Join(stepDir, TaskScriptName)
 	var fp *os.File
-	if fp, err = os.OpenFile(scriptPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err != nil {
-		return err
+	if fp, err = os.OpenFile(scriptPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755); err != nil {
+		return "", err
 	}
 	defer fp.Close()
 
 	if _, err = fp.WriteString(command); err != nil {
-		return err
+		return "", err
 	}
 
-	return nil
+	return scriptPath, nil
+}
+
+var checkoutCommandTpl = template.Must(template.New("").Parse(`#!/bin/sh
+if [[ ! -e code ]]; then git clone '{{.Req.RepoAddress}}' code || exit $?; fi && \
+cd code && \
+echo 'checkout {{.Req.RepoCommitId}}.' && \
+git checkout -q '{{.Req.RepoCommitId}}' && \
+cd '{{.Req.Env.Workdir}}'
+`))
+
+func (t *Task) stepCheckout() (command string, err error) {
+	return t.executeTpl(checkoutCommandTpl, map[string]interface{}{
+		"Req": t.req,
+	})
 }
 
 var initCommandTpl = template.Must(template.New("").Parse(`#!/bin/sh
-if [[ ! -e code ]]; then git clone '{{.Req.RepoAddress}}' code; fi && \
 cd 'code/{{.Req.Env.Workdir}}' && \
-git checkout -q '{{.Req.RepoRevision}}' && echo check out $(git rev-parse --short HEAD). && \
 ln -sf '{{.IacTfFile}}' . && \
+ln -sf '{{.terraformrc}}' ~/.terraformrc && \
 tfenv install $TFENV_TERRAFORM_VERSION && \
 tfenv use $TFENV_TERRAFORM_VERSION  && \
 terraform init -input=false {{- range $arg := .Req.StepArgs }} {{$arg}}{{ end }}
@@ -341,8 +449,14 @@ func (t *Task) up2Workspace(name string) string {
 }
 
 func (t *Task) stepInit() (command string, err error) {
+	tfrcName := "terraformrc-default"
+	if configs.Get().Runner.OfflineMode {
+		tfrcName = "terraformrc-offline"
+	}
+	tfrc := filepath.Join(ContainerAssetsDir, tfrcName)
 	return t.executeTpl(initCommandTpl, map[string]interface{}{
 		"Req":             t.req,
+		"terraformrc":     tfrc,
 		"PluginCachePath": ContainerPluginCachePath,
 		"IacTfFile":       t.up2Workspace(CloudIacTfFile),
 	})
@@ -350,7 +464,6 @@ func (t *Task) stepInit() (command string, err error) {
 
 var planCommandTpl = template.Must(template.New("").Parse(`#!/bin/sh
 cd 'code/{{.Req.Env.Workdir}}' && \
-tfenv use $TFENV_TERRAFORM_VERSION && \
 terraform plan -input=false -out=_cloudiac.tfplan \
 {{if .TfVars}}-var-file={{.TfVars}}{{end}} \
 {{ range $arg := .Req.StepArgs }}{{$arg}} {{ end }}&& \
@@ -368,7 +481,6 @@ func (t *Task) stepPlan() (command string, err error) {
 // 当指定了 plan 文件时不需要也不能传 -var-file 参数
 var applyCommandTpl = template.Must(template.New("").Parse(`#!/bin/sh
 cd 'code/{{.Req.Env.Workdir}}' && \
-tfenv use $TFENV_TERRAFORM_VERSION && \
 terraform apply -input=false -auto-approve \
 {{ range $arg := .Req.StepArgs}}{{$arg}} {{ end }}_cloudiac.tfplan
 `))
@@ -416,9 +528,8 @@ func (t *Task) stepPlay() (command string, err error) {
 var cmdCommandTpl = template.Must(template.New("").Parse(`#!/bin/sh
 (test -d 'code/{{.Req.Env.Workdir}}' && cd 'code/{{.Req.Env.Workdir}}')
 {{ range $index, $command := .Commands -}}
-{{$command}} && \
+{{$command}}
 {{ end -}}
-sleep 0
 `))
 
 func (t *Task) stepCommand() (command string, err error) {
@@ -452,7 +563,7 @@ var parseCommandTpl = template.Must(template.New("").Parse(`#!/bin/sh
 cd 'code/{{.Req.Env.Workdir}}' && \
 mkdir -p {{.PoliciesDir}} && \
 mkdir -p ~/.terrascan/pkg/policies/opa/rego/aws && \
-terrascan scan --config-only -l debug -o json > {{.TFScanJsonFilePath}}
+terrascan scan --config-only -l debug -o json --iac-type terraform > {{.TFScanJsonFilePath}}
 `))
 
 func (t *Task) stepTfParse() (command string, err error) {
@@ -486,9 +597,11 @@ func (t *Task) stepTfScan() (command string, err error) {
 }
 
 var scanInitCommandTpl = template.Must(template.New("").Parse(`#!/bin/sh
-git clone '{{.Req.RepoAddress}}' code && \
-cd 'code/{{.Req.Env.Workdir}}' && \
-git checkout -q '{{.Req.RepoRevision}}' && echo check out $(git rev-parse --short HEAD).
+if [[ ! -e code ]]; then git clone '{{.Req.RepoAddress}}' code || exit $?; fi && \
+cd code && \
+echo 'checkout {{.Req.RepoCommitId}}.' && \
+git checkout -q '{{.Req.RepoCommitId}}' && \
+cd '{{.Req.Env.Workdir}}'
 `))
 
 func (t *Task) stepScanInit() (command string, err error) {

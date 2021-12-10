@@ -5,8 +5,8 @@ package task_manager
 import (
 	"cloudiac/common"
 	"cloudiac/configs"
+	"cloudiac/portal/apps"
 	"cloudiac/portal/consts"
-	"cloudiac/portal/consts/e"
 	"cloudiac/portal/libs/db"
 	"cloudiac/portal/models"
 	"cloudiac/portal/services"
@@ -19,9 +19,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/acarl005/stripansi"
 
 	"github.com/pkg/errors"
 )
@@ -145,13 +149,76 @@ func (m *TaskManager) start() {
 		}
 
 		m.processPendingTask(ctx)
-
+		// 执行所有偏移检测任务
+		m.beginCronDriftTask()
 		select {
 		case <-ticker.C:
 			continue
 		case <-ctx.Done():
 			m.logger.Infof("context done: %v", ctx.Err())
 			return
+		}
+	}
+}
+
+// 开始所有漂移检测任务
+func (m *TaskManager) beginCronDriftTask() {
+	logger := m.logger
+	cronDriftEnvs := make([]*models.Env, 0)
+	query := m.db.Where("status = ? and open_cron_drift = ? and next_drift_task_time <= ?", models.EnvStatusActive, true, time.Now())
+	if err := query.Model(&models.Env{}).Find(&cronDriftEnvs); err != nil {
+		logger.Error(err)
+		return
+	}
+	// 查询出来所有需要开启偏移检测的环境任务，并且创建
+	for _, env := range cronDriftEnvs {
+		task, err := services.GetTaskById(m.db, env.LastTaskId)
+		if err != nil {
+			logger.Errorf("create cronDriftTask failed, error: %v", err)
+			continue
+		}
+		// 先查询这个环境有没有排队中的偏移检测任务了, 有就不创建了
+		existCronPengdingTask, err := services.ListPendingCronTask(m.db, env.Id)
+		if err != nil {
+			logger.Errorf("create cronDriftTask failed, error: %v", err)
+			continue
+		}
+		// 如果查询出来有排队或执行中的漂移检测任务，则本次跳过
+		if existCronPengdingTask {
+			continue
+		}
+		// 这里每次都去解析env表保存的最新的cron 表达式
+		envCronTaskType, err := apps.GetCronTaskTypeAndCheckParam(env.CronDriftExpress, env.AutoRepairDrift, env.OpenCronDrift)
+		if err != nil {
+			logger.Errorf("create cronDriftTask failed, error: %v", err)
+			continue
+		}
+		if envCronTaskType != "" {
+			attrs := models.Attrs{}
+			nextTime, err := apps.ParseCronpress(env.CronDriftExpress)
+			if err != nil {
+				logger.Errorf("create cronDriftTask failed, error: %v", err)
+				continue
+			}
+			task.Type = envCronTaskType
+			task.IsDriftTask = true
+			err = services.DeleteHistoryCronTask(m.db)
+			// 删除历史数据失败，继续剩余流程。
+			if err != nil {
+				logger.Errorf("delete expired task and task step failed, error: %v", err)
+			}
+			_, err = services.CloneNewDriftTask(m.db, *task, env)
+			if err != nil {
+				logger.Errorf("create cronDriftTask failed, error: %v", err)
+				continue
+			}
+
+			attrs["nextDriftTaskTime"] = nextTime
+			_, err = services.UpdateEnv(m.db, env.Id, attrs)
+			if err != nil {
+				logger.Errorf("create cronDriftTask failed, error: %v", err)
+				continue
+			}
 		}
 	}
 }
@@ -340,11 +407,11 @@ func (m *TaskManager) runTask(ctx context.Context, task models.Tasker) error {
 		case *models.Task:
 			if startErr := m.doRunTask(ctx, t); startErr == nil {
 				// 任务启动成功，执行任务结束后的处理函数
-				m.processTaskDone(t)
+				m.processTaskDone(t.Id)
 			}
 		case *models.ScanTask:
 			if startErr := m.doRunScanTask(ctx, t); startErr == nil {
-				m.processScanTaskDone(t)
+				m.processScanTaskDone(t.Id)
 			}
 		}
 	}()
@@ -355,8 +422,8 @@ func (m *TaskManager) runTask(ctx context.Context, task models.Tasker) error {
 func (m *TaskManager) doRunTask(ctx context.Context, task *models.Task) (startErr error) {
 	logger := m.logger.WithField("taskId", task.Id)
 
-	changeTaskStatus := func(status, message string) error {
-		if er := services.ChangeTaskStatus(m.db, task, status, message); er != nil {
+	changeTaskStatus := func(status, message string, skipUpdateEnv bool) error {
+		if er := services.ChangeTaskStatus(m.db, task, status, message, skipUpdateEnv); er != nil {
 			logger.Errorf("update task status error: %v", er)
 			return er
 		}
@@ -366,15 +433,29 @@ func (m *TaskManager) doRunTask(ctx context.Context, task *models.Task) (startEr
 	taskStartFailed := func(err error) {
 		logger.Infof("task failed: %s", err)
 		startErr = err
-		_ = changeTaskStatus(models.TaskFailed, err.Error())
+		_ = changeTaskStatus(models.TaskFailed, err.Error(), false)
 	}
 
 	logger.Infof("run task: %s", task.Id)
 
+	if task.IsDriftTask {
+		if env, err := services.GetEnvById(m.db, task.EnvId); err != nil {
+			if err != nil {
+				logger.Errorf("get task environment %s: %v", task.EnvId, err)
+				taskStartFailed(errors.New("get task environment failed"))
+				return
+			}
+		} else if env.Status != models.EnvStatusActive {
+			startErr = errors.New("environment is not active")
+			_ = changeTaskStatus(models.TaskFailed, startErr.Error(), true)
+			return
+		}
+	}
+
 	if !task.Started() { // 任务可能为己启动状态(比如异常退出后的任务恢复)，这里判断一下
 		// 先更新任务为 running 状态
 		// 极端情况下任务未执行好过重复执行，所以先设置状态，后发起调用
-		if err := changeTaskStatus(models.TaskRunning, ""); err != nil {
+		if err := changeTaskStatus(models.TaskRunning, "", false); err != nil {
 			return
 		}
 	}
@@ -406,19 +487,29 @@ func (m *TaskManager) doRunTask(ctx context.Context, task *models.Task) (startEr
 		}
 
 		if _, err = m.db.Model(task).UpdateAttrs(models.Attrs{"CurrStep": step.Index}); err != nil {
-			logger.Errorf("update task error: %v", err)
-			break
+			taskStartFailed(errors.Wrap(err, "update task"))
+			return
+		}
+		task.CurrStep = step.Index
+
+		{
+			// 获取 task 最新的 containerId
+			tTask, err := services.GetTaskById(m.db, task.Id)
+			if err != nil {
+				taskStartFailed(errors.Wrapf(err, "get task %s", task.Id.String()))
+				return
+			}
+			runTaskReq.ContainerId = tTask.ContainerId
 		}
 
 		runErr := m.runTaskStep(ctx, *runTaskReq, task, step)
-
-		if err = m.processStepDone(task, step); err != nil {
-			logger.Infof("process step done: %v", err)
+		if err := m.processStepDone(task, step); err != nil {
+			logger.Warnf("process step done: %v", err)
 			break
 		}
 
 		if runErr != nil {
-			if step.Type == common.TaskStepTfScan && !task.StopOnViolation {
+			if step.Type == common.TaskStepOpaScan && !task.StopOnViolation {
 				// 合规任务失败不影响环境部署流程
 				logger.Warnf("run scan task step: %v", runErr)
 				continue
@@ -428,25 +519,9 @@ func (m *TaskManager) doRunTask(ctx context.Context, task *models.Task) (startEr
 		}
 	}
 
-	if task.IsEffectTask() && step != nil && !step.IsRejected() {
-		// 执行信息采集步骤
-		if err := m.runTaskStep(ctx, *runTaskReq, task, &models.TaskStep{
-			TaskStepBody: models.TaskStepBody{
-				Type: models.TaskStepCollect,
-			},
-			OrgId:     task.OrgId,
-			ProjectId: task.ProjectId,
-			EnvId:     task.EnvId,
-			TaskId:    task.Id,
-			Index:     common.CollectTaskStepIndex,
-			Status:    models.TaskStepPending,
-		}); err != nil {
-			logger.Errorf("run collect step error: %v", err)
-		} else {
-			logger.Infof("collect step done")
-		}
+	if err := m.runTaskStepsDoneActions(ctx, task.Id); err != nil {
+		logger.Errorf("runTaskStepsDoneActions: %v", err)
 	}
-
 	logger.Infof("run task finish")
 	return nil
 }
@@ -493,7 +568,7 @@ func (m *TaskManager) processStepDone(task *models.Task, step *models.TaskStep) 
 	}
 
 	switch step.Type {
-	case common.TaskStepTfScan:
+	case common.TaskStepOpaScan:
 		return processScanResult()
 	}
 	return nil
@@ -510,11 +585,18 @@ func readIfExist(path string) ([]byte, error) {
 	return content, nil
 }
 
-func (m *TaskManager) processTaskDone(task *models.Task) {
-	logger := m.logger.WithField("func", "processTaskDone").WithField("taskId", task.Id)
+func (m *TaskManager) processTaskDone(taskId models.Id) {
+	logger := m.logger.WithField("func", "processTaskDone").WithField("taskId", taskId)
 	logger.Debugln("start process task done")
 
 	dbSess := m.db
+
+	// 重新查询获取 task，确保使用的是最新的 task 数据
+	task, err := services.GetTaskById(dbSess, taskId)
+	if err != nil {
+		logger.Errorf("get task %s: %v", taskId, err)
+		return
+	}
 
 	// 分析环境资源、outputs
 	processState := func() error {
@@ -541,9 +623,6 @@ func (m *TaskManager) processTaskDone(task *models.Task) {
 			}
 			if err = services.SaveTaskOutputs(dbSess, task, tfState.Values.Outputs); err != nil {
 				return fmt.Errorf("save task outputs: %v", err)
-			}
-			if err = services.UpdateEnvModel(dbSess, task.EnvId, models.Env{LastResTaskId: task.Id}); err != nil {
-				return fmt.Errorf("update env lastResTaskId: %v", err)
 			}
 		}
 
@@ -601,6 +680,10 @@ func (m *TaskManager) processTaskDone(task *models.Task) {
 		return nil
 	}
 
+	if err := StopTaskContainers(dbSess, task.Id); err != nil {
+		logger.Warnf("stop task container: %v", err)
+	}
+
 	lastStep, err := services.GetTaskStep(dbSess, task.Id, task.CurrStep)
 	if err != nil {
 		logger.Errorf("get task step(%d) error: %v", err, task.CurrStep)
@@ -631,11 +714,68 @@ func (m *TaskManager) processTaskDone(task *models.Task) {
 			}
 		}
 
+		if lastStep.Status == models.TaskComplete && task.IsDriftTask {
+			// 判断是否是偏移检测任务，如果是，解析log文件并写入表
+			step, err := services.GetTaskPlanStep(db.Get(), task.Id)
+			if err != nil {
+				// 解析失败任务不停止不影响主流程
+				logger.Errorf("read plan output log: %v", err)
+			} else {
+				if bs, err := readIfExist(task.TFPlanOutputLogPath(fmt.Sprintf("step%d", step.Index))); err != nil {
+					logger.Errorf("read plan output log: %v", err)
+				} else {
+					// 解析并保存资源漂移信息
+					env, err := services.GetEnv(dbSess, task.EnvId)
+					if err != nil {
+						logger.Errorf("get env '%s'", task.EnvId)
+						return
+					}
+					driftInfoMap := ParseResourceDriftInfo(bs)
+					if len(driftInfoMap) == 0 {
+						err = services.DeleteEnvResourceDrift(dbSess, env.LastResTaskId)
+						if err != nil {
+							logs.Get().Error("Failed to delete all resoruce drift information in the environment")
+						}
+					} else {
+						addressList := []string{}
+						for address, _ := range driftInfoMap {
+							addressList = append(addressList, address)
+						}
+						err = services.DeleteEnvResourceDriftByAddressList(dbSess, env.LastResTaskId, addressList)
+						if err != nil {
+							logs.Get().Error("Failed to delete already repair resoruce drift information in the environment")
+						}
+						for address, driftInfo := range driftInfoMap {
+							res, err := services.GetResourceIdByAddressAndTaskId(dbSess, address, env.LastResTaskId)
+							if err != nil {
+								logs.Get().Error("Failed to query resource table while writing drift resource")
+								continue
+							} else {
+								driftInfo.ResId = res.Id
+								// TODO 后续使用batch 改进
+								services.InsertOrUpdateCronTaskInfo(db.Get(), driftInfo)
+							}
+						}
+					}
+
+					if len(driftInfoMap) > 0 {
+						// 发送邮件通知
+						services.TaskStatusChangeSendMessage(task, consts.EvenvtCronDrift)
+					}
+				}
+			}
+		}
+
 		if err := updateTaskStatus(); err != nil {
 			logger.Errorf("update task status error: %v", err)
 		}
 
 		if task.IsEffectTask() {
+			// 注意：环境的 lastResTaskId 必须在资源漂移信息统计后执行
+			if err = services.UpdateEnvModel(dbSess, task.EnvId, models.Env{LastResTaskId: task.Id}); err != nil {
+				logger.Errorf("update env lastResTaskId: %v", err)
+			}
+
 			// 注意: 该步骤需要在环境状态被更新之后执行
 			if err := processAutoDestroy(); err != nil {
 				logger.Errorf("process auto destroy: %v", err)
@@ -644,8 +784,11 @@ func (m *TaskManager) processTaskDone(task *models.Task) {
 	}
 }
 
-func (m *TaskManager) runTaskStep(ctx context.Context, taskReq runner.RunTaskReq,
-	task *models.Task, step *models.TaskStep) (err error) {
+func (m *TaskManager) runTaskStep(
+	ctx context.Context,
+	taskReq runner.RunTaskReq,
+	task *models.Task,
+	step *models.TaskStep) (err error) {
 	logger := m.logger.WithField("taskId", taskReq.TaskId)
 	logger = logger.WithField("func", "runTaskStep").
 		WithField("step", fmt.Sprintf("%d(%s)", step.Index, step.Type))
@@ -658,6 +801,15 @@ func (m *TaskManager) runTaskStep(ctx context.Context, taskReq runner.RunTaskReq
 		}
 	}()
 
+	if step.NextStep != "" {
+		if nextStep, err := services.GetTaskStepByStepId(m.db, step.NextStep); err != nil {
+			err = errors.Wrapf(err, "get task step %s", string(step.NextStep))
+			return err
+		} else if nextStep.MustApproval {
+			taskReq.PauseTask = true
+		}
+	}
+
 	changeStepStatusAndStepRetryTimes := func(status, message string, step *models.TaskStep) {
 		var er error
 		if er = services.ChangeTaskStepStatusAndUpdate(m.db, task, step, status, message); er != nil {
@@ -667,7 +819,7 @@ func (m *TaskManager) runTaskStep(ctx context.Context, taskReq runner.RunTaskReq
 		}
 	}
 
-	if !task.AutoApprove && !step.IsApproved() {
+	if step.MustApproval && !step.IsApproved() {
 		logger.Infof("waitting task step approve")
 		changeStepStatusAndStepRetryTimes(models.TaskStepApproving, "", step)
 		var newStep *models.TaskStep
@@ -705,8 +857,8 @@ loop:
 		case models.TaskStepPending, models.TaskApproving:
 			// 先将步骤置为 running 状态，然后再发起调用，保证步骤不会重复执行
 			changeStepStatusAndStepRetryTimes(models.TaskStepRunning, "", step)
-			if err, retryAble := StartTaskStep(taskReq, *step); err != nil {
-				logger.Infof("start task step %d(%s)", step.Index, step.Type)
+			if cid, retryAble, err := StartTaskStep(taskReq, *step); err != nil {
+				logger.Warnf("start task step %s(%d): %v", step.Type, step.Index, err)
 				// 如果是可重试错误，并且任务设定可以重试, 则运行重试逻辑
 				if retryAble && task.RetryAble {
 					if step.RetryNumber > 0 && step.CurrentRetryCount < step.RetryNumber {
@@ -720,6 +872,10 @@ loop:
 					changeStepStatusAndStepRetryTimes(models.TaskStepFailed, err.Error(), step)
 					return err
 				}
+			} else if task.ContainerId == "" {
+				if err := services.UpdateTaskContainerId(m.db, models.Id(taskReq.TaskId), cid); err != nil {
+					panic(errors.Wrapf(err, "update task %s container id", taskReq.TaskId))
+				}
 			}
 		case models.TaskStepRunning:
 			stepResult, err := WaitTaskStep(ctx, m.db, task, step)
@@ -729,13 +885,13 @@ loop:
 				return err
 			}
 			// 合规检测步骤不通过，不需要重试，跳出循环
-			if step.Type == models.TaskStepTfScan &&
+			if step.Type == models.TaskStepOpaScan &&
 				stepResult.Result.ExitCode == common.TaskStepPolicyViolationExitCode {
 				message := "Scan task step finished with violations found."
 				changeStepStatusAndStepRetryTimes(models.TaskStepFailed, message, step)
 				break loop
 			}
-			if stepResult.Status == models.TaskStepFailed {
+			if stepResult.Status == models.TaskStepFailed || stepResult.Status == models.TaskStepTimeout {
 				if task.RetryAble && step.RetryNumber > 0 && step.CurrentRetryCount < step.RetryNumber {
 					step.NextRetryTime = time.Now().Unix() + int64(task.RetryDelay)
 					step.CurrentRetryCount += 1
@@ -752,12 +908,17 @@ loop:
 	case models.TaskStepComplete:
 		return nil
 	case models.TaskStepFailed:
+		message := "failed"
 		if step.Message != "" {
-			return fmt.Errorf(step.Message)
+			message = step.Message
 		}
-		return errors.New("failed")
+		return fmt.Errorf(message)
 	case models.TaskStepTimeout:
-		return errors.New("timeout")
+		message := "timeout"
+		if step.Message != "" {
+			message = step.Message
+		}
+		return fmt.Errorf(message)
 	default:
 		return fmt.Errorf("unknown step status: %v", step.Status)
 	}
@@ -785,6 +946,10 @@ func buildRunTaskReq(dbSess *db.Session, task models.Task) (taskReq *runner.RunT
 		EnvironmentVars: make(map[string]string),
 		TerraformVars:   make(map[string]string),
 		AnsibleVars:     make(map[string]string),
+	}
+
+	if runnerEnv.TfVersion == "" {
+		runnerEnv.TfVersion = consts.DefaultTerraformVersion
 	}
 
 	for _, v := range task.Variables {
@@ -821,13 +986,20 @@ func buildRunTaskReq(dbSess *db.Session, task models.Task) (taskReq *runner.RunT
 		Env:             runnerEnv,
 		RunnerId:        task.RunnerId,
 		TaskId:          string(task.Id),
-		DockerImage:     "",
+		DockerImage:     task.Flow.Image,
 		StateStore:      stateStore,
 		RepoAddress:     task.RepoAddr,
-		RepoRevision:    task.CommitId,
+		RepoBranch:      task.Revision,
+		RepoCommitId:    task.CommitId,
 		Timeout:         task.StepTimeout,
 		StopOnViolation: task.StopOnViolation,
+		ContainerId:     task.ContainerId,
 	}
+
+	if err := runTaskReqAddSysEnvs(taskReq); err != nil {
+		return nil, err
+	}
+
 	if scanStep, err := services.GetTaskScanStep(dbSess, task.Id); err == nil && scanStep != nil {
 		policies, err := services.GetTaskPolicies(dbSess, task.Id)
 		if err != nil {
@@ -878,40 +1050,13 @@ func (m *TaskManager) processAutoDestroy() error {
 				}
 			}()
 
-			tpl, err := services.GetTemplateById(tx, env.TplId)
+			task, err := services.CreateAutoDestroyTask(tx, env)
 			if err != nil {
 				_ = tx.Rollback()
-				if e.IsRecordNotFound(err) {
-					logger.Warnf("template %s not exists", env.TplId)
-					return nil
-				} else {
-					logger.Errorf("get template %s error: %v", env.TplId, err)
-					return err
-				}
-			}
-
-			vars, err, _ := services.GetValidVariables(tx, consts.ScopeEnv, env.OrgId, env.ProjectId, env.TplId, env.Id, true)
-			if err != nil {
-				logger.Errorf("get vairables error: %v", err)
+				logger.Errorf("create auto destroy task: %v", err)
 				return nil
 			}
 
-			taskVars := services.GetVariableBody(vars)
-
-			task, err := services.CreateTask(tx, tpl, env, models.Task{
-				Name:            "Auto Destroy",
-				Targets:         nil,
-				CreatorId:       consts.SysUserId,
-				Variables:       taskVars,
-				AutoApprove:     true,
-				StopOnViolation: env.StopOnViolation,
-				BaseTask: models.BaseTask{
-					Type:        models.TaskTypeDestroy,
-					Flow:        models.TaskFlow{},
-					StepTimeout: 0,
-					RunnerId:    "",
-				},
-			})
 			if err != nil {
 				_ = tx.Rollback()
 				logger.Errorf("create task error: %v", err)
@@ -1009,6 +1154,13 @@ func (m *TaskManager) doRunScanTask(ctx context.Context, task *models.ScanTask) 
 			break
 		}
 
+		// 重新读取 task，获取最新的 containerId
+		task, err = services.GetScanTaskById(m.db, task.Id)
+		if err != nil {
+			taskStartFailed(errors.Wrapf(err, "get task %s", task.Id.String()))
+			return
+		}
+
 		runTaskReq, err := buildScanTaskReq(m.db, task, step)
 		if err != nil {
 			taskStartFailed(err)
@@ -1025,10 +1177,18 @@ func (m *TaskManager) doRunScanTask(ctx context.Context, task *models.ScanTask) 
 	return nil
 }
 
-func (m *TaskManager) processScanTaskDone(task *models.ScanTask) {
-	logger := m.logger.WithField("func", "processTaskDone").WithField("taskId", task.Id)
+func (m *TaskManager) processScanTaskDone(taskId models.Id) {
+	logger := m.logger.WithField("func", "processScanTaskDone").WithField("taskId", taskId)
 
 	dbSess := m.db
+
+	// 重新查询获取 task，确保使用的是最新的 task 数据
+	task, err := services.GetScanTaskById(dbSess, taskId)
+	if err != nil {
+		logger.Errorf("get task %s: %v", taskId, err)
+		return
+	}
+
 	read := func(path string) ([]byte, error) {
 		content, err := logstorage.Get().Read(path)
 		if err != nil {
@@ -1065,6 +1225,10 @@ func (m *TaskManager) processScanTaskDone(task *models.ScanTask) {
 		return err
 	}
 
+	if err := StopScanTaskContainers(dbSess, task.Id); err != nil {
+		logger.Warnf("stop task container: %v", err)
+	}
+
 	lastStep, err := services.GetTaskStep(dbSess, task.Id, task.CurrStep)
 	if err != nil {
 		logger.Errorf("get task step(%d) error: %v", err, task.CurrStep)
@@ -1097,8 +1261,11 @@ func buildScanTaskReq(dbSess *db.Session, task *models.ScanTask, step *models.Ta
 		TaskId:          string(task.Id),
 		Timeout:         task.StepTimeout,
 		RepoAddress:     task.RepoAddr,
-		RepoRevision:    task.CommitId,
+		RepoBranch:      task.Revision,
+		RepoCommitId:    task.CommitId,
 		StopOnViolation: true,
+		DockerImage:     task.Flow.Image,
+		ContainerId:     task.ContainerId,
 		//Repos: []runner.Repository{
 		//	{
 		//		RepoAddress:  task.RepoAddr,
@@ -1107,7 +1274,11 @@ func buildScanTaskReq(dbSess *db.Session, task *models.ScanTask, step *models.Ta
 		//},
 	}
 
-	if step.Type == models.TaskStepTfScan {
+	if err := runTaskReqAddSysEnvs(taskReq); err != nil {
+		return nil, err
+	}
+
+	if step.Type == models.TaskStepOpaScan {
 		taskReq.Policies, err = services.GetTaskPolicies(dbSess, task.Id)
 		if err != nil {
 			return nil, errors.Wrapf(err, "get scan task '%s' policies error: %v", task.Id, err)
@@ -1120,7 +1291,7 @@ func buildScanTaskReq(dbSess *db.Session, task *models.ScanTask, step *models.Ta
 func (m *TaskManager) runScanTaskStep(ctx context.Context, taskReq runner.RunTaskReq,
 	task *models.ScanTask, step *models.TaskStep) (err error) {
 	logger := m.logger.WithField("taskId", taskReq.TaskId)
-	logger = logger.WithField("func", "runTaskStep").
+	logger = logger.WithField("func", "runScanTaskStep").
 		WithField("step", fmt.Sprintf("%d(%s)", step.Index, step.Type))
 
 	defer func() {
@@ -1130,6 +1301,15 @@ func (m *TaskManager) runScanTaskStep(ctx context.Context, taskReq runner.RunTas
 			logger.Debugf("%s", debug.Stack())
 		}
 	}()
+
+	if step.NextStep != "" {
+		if nextStep, err := services.GetTaskStepByStepId(m.db, step.NextStep); err != nil {
+			err = errors.Wrapf(err, "get task step %s", string(step.NextStep))
+			return err
+		} else if nextStep.MustApproval {
+			taskReq.PauseTask = true
+		}
+	}
 
 	changeStepStatus := func(status, message string) {
 		var er error
@@ -1154,10 +1334,14 @@ loop:
 			// 先将步骤置为 running 状态，然后再发起调用，保证步骤不会重复执行
 			changeStepStatus(models.TaskStepRunning, "")
 			logger.Infof("start task step %d(%s)", step.Index, step.Type)
-			if err, _ = StartTaskStep(taskReq, *step); err != nil {
+			if cid, _, err := StartTaskStep(taskReq, *step); err != nil {
 				logger.Errorf("start task step error: %s", err.Error())
 				changeStepStatus(models.TaskStepFailed, err.Error())
 				return err
+			} else if task.ContainerId == "" {
+				if err := services.UpdateScanTaskContainerId(m.db, models.Id(taskReq.TaskId), cid); err != nil {
+					panic(errors.Wrapf(err, "update job %s container id", taskReq.TaskId))
+				}
 			}
 		case models.TaskStepRunning:
 			if _, err = WaitScanTaskStep(ctx, m.db, task, step); err != nil {
@@ -1183,4 +1367,75 @@ loop:
 	default:
 		return fmt.Errorf("unknown step status: %v", step.Status)
 	}
+}
+
+// 为 req 添加 sysEnvs(直接修改传入的 req)
+func runTaskReqAddSysEnvs(req *runner.RunTaskReq) error {
+	sysEnvs := make(map[string]string)
+
+	// CLOUDIAC_TASK_ID	当前任务的 id
+	sysEnvs["CLOUDIAC_TASK_ID"] = req.TaskId
+	// CLOUDIAC_BRANCH	当前任务的云模板代码的分支
+	sysEnvs["CLOUDIAC_BRANCH"] = req.RepoBranch
+	// CLOUDIAC_COMMIT	当前任务的云模板代码 commit hash
+	sysEnvs["CLOUDIAC_COMMIT"] = req.RepoCommitId
+
+	if req.Env.Id != "" {
+		env, err := services.GetEnvById(db.Get(), models.Id(req.Env.Id))
+		if err != nil {
+			return errors.Wrapf(err, "query env %s", req.Env.Id)
+		}
+
+		resCount, err := services.GetEnvResourceCount(db.Get(), env.Id)
+		if err != nil {
+			return errors.Wrapf(err, "%s, query environment resource count", req.Env.Id)
+		}
+
+		// 当前任务的组织 ID
+		sysEnvs["CLOUDIAC_ORG_ID"] = env.OrgId.String()
+		// 当前任务的项目 ID
+		sysEnvs["CLOUDIAC_PROJECT_ID"] = env.ProjectId.String()
+
+		// CLOUDIAC_TEMPLATE_ID	当前任务的模板 ID
+		sysEnvs["CLOUDIAC_TEMPLATE_ID"] = env.TplId.String()
+		// CLOUDIAC_ENV_ID	当前任务的环境 ID
+		sysEnvs["CLOUDIAC_ENV_ID"] = env.Id.String()
+		// CLOUDIAC_ENV_NAME	当前任务的环境名称
+		sysEnvs["CLOUDIAC_ENV_NAME"] = env.Name
+		// CLOUDIAC_ENV_STATUS	当前环境状态(启动任务时)
+		sysEnvs["CLOUDIAC_ENV_STATUS"] = env.Status
+		// 当前环境中的资源数量(启动任务时)
+		sysEnvs["CLOUDIAC_ENV_RESOURCES"] = fmt.Sprintf("%d", resCount)
+		// CLOUDIAC_TF_VERSION	当前任务使用的 terraform 版本号(eg. 0.14.11)
+		sysEnvs["CLOUDIAC_TF_VERSION"] = req.Env.TfVersion
+	}
+
+	req.SysEnvironments = sysEnvs
+	return nil
+}
+
+func ParseResourceDriftInfo(bs []byte) map[string]models.ResourceDrift {
+	content := strings.Split(string(bs), "\n")
+	cronTaskInfoMap := make(map[string]models.ResourceDrift, 0)
+	for k, v := range content {
+		if strings.Contains(v, "#") && strings.Contains(v, "must be") || strings.Contains(v, "will be") {
+			var resourceDetail string
+			cronTaskInfo := models.ResourceDrift{}
+			reg1 := regexp.MustCompile(`#\s\S*`)
+			result1 := reg1.FindAllStringSubmatch(v, 1)
+			address := stripansi.Strip(strings.TrimSpace(result1[0][0][1:]))
+			for k1, v2 := range content[k+1:] {
+				if strings.Contains(v2, "#") && strings.Contains(v2, "must be") || strings.Contains(v2, "will be") {
+					resourceDetail = strings.Join(content[k+1:k1+k], "\n")
+					break
+				} else if strings.Contains(v2, "Plan:") {
+					resourceDetail = strings.Join(content[k+1:k1+k], "\n")
+					break
+				}
+			}
+			cronTaskInfo.DriftDetail = resourceDetail
+			cronTaskInfoMap[address] = cronTaskInfo
+		}
+	}
+	return cronTaskInfoMap
 }

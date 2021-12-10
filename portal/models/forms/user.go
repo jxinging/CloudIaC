@@ -24,7 +24,7 @@ type UpdateUserForm struct {
 }
 
 type SearchUserForm struct {
-	PageForm
+	NoPageSizeForm
 
 	Q       string `form:"q" json:"q" binding:""`                       // 用户名，支持模糊查询
 	Status  string `form:"status" json:"status" enums:"enable,disable"` // 状态
@@ -70,5 +70,15 @@ type UpdateUserOrgRelForm struct {
 
 	Id     models.Id `uri:"id" json:"id" binding:"" swaggerignore:"true"`              // 组织ID
 	UserId models.Id `uri:"userId" json:"userId" binding:"" swaggerignore:"true"`      // 用户ID
+	Role   string    `form:"role" json:"role" binding:"required" enums:"admin,member"` // 用户在组织中的角色，组织管理员：admin，普通用户：member，默认 member
+}
+
+type UpdateUserOrgForm struct {
+	BaseForm
+
+	Id     models.Id `uri:"id" json:"id" binding:"" swaggerignore:"true"`         // 组织ID
+	UserId models.Id `uri:"userId" json:"userId" binding:"" swaggerignore:"true"` // 用户ID
+	Name   string    `form:"name" json:"name" binding:""`                         // 用户名
+	Phone  string    `form:"phone" json:"phone" binding:""`
 	Role   string    `form:"role" json:"role" binding:"required" enums:"admin,member"` // 用户在组织中的角色，组织管理员：admin，普通用户：member，默认 member
 }

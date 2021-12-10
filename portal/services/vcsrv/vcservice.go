@@ -8,10 +8,10 @@ import (
 	"cloudiac/portal/consts/e"
 	"cloudiac/portal/libs/db"
 	"cloudiac/portal/models"
+	"cloudiac/utils"
 	"fmt"
-	"path"
-
 	"github.com/pkg/errors"
+	"path"
 )
 
 /*
@@ -85,6 +85,9 @@ type RepoIface interface {
 
 	//AddWebhook 查询Webhook列表
 	AddWebhook(url string) error
+
+	//CreatePrComment 添加PR评论
+	CreatePrComment(prId int, comment string) error
 }
 
 func GetVcsInstance(vcs *models.Vcs) (VcsIface, error) {
@@ -141,19 +144,8 @@ func GetRepoAddress(repo RepoIface) (string, error) {
 	return p.HTTPURLToRepo, nil
 }
 
-func SetWebhook(vcs *models.Vcs, repoId string, triggers []string) error {
-	webhookUrl := configs.Get().Portal.Address + "/api/v1"
-	switch vcs.VcsType {
-	case models.VcsGitlab:
-		webhookUrl += WebhookUrlGitlab
-	case models.VcsGitea:
-		webhookUrl += WebhookUrlGitea
-	case models.VcsGitee:
-		webhookUrl += WebhookUrlGitee
-	case models.VcsGithub:
-		webhookUrl += WebhookUrlGithub
-	}
-	webhookUrl += fmt.Sprintf("/%s", vcs.Id.String())
+func SetWebhook(vcs *models.Vcs, repoId, apiToken string, triggers []string) error {
+	webhookUrl := GetWebhookUrl(vcs, apiToken)
 	repo, err := GetRepo(vcs, repoId)
 	if err != nil {
 		return err
@@ -176,8 +168,9 @@ func SetWebhook(vcs *models.Vcs, repoId string, triggers []string) error {
 	if len(triggers) == 0 {
 		// 判断同vcs、仓库的环境是否存在
 		exist, err := db.Get().Table(models.Env{}.TableName()).
-			Where("vcs_id = ?", vcs.Id).
-			Where("triggers not null").Exists()
+			Joins("left join iac_template as tpl on iac_env.tpl_id = tpl.id").
+			Where("tpl.vcs_id = ?", vcs.Id).
+			Where("iac_env.triggers IS NOT NULL or iac_env.triggers != '{}'").Exists()
 		if err != nil {
 			return err
 		}
@@ -197,4 +190,24 @@ func SetWebhook(vcs *models.Vcs, repoId string, triggers []string) error {
 		}
 		return nil
 	}
+}
+
+func GetVcsToken(token string) (string, error) {
+	return utils.DecryptSecretVar(token)
+}
+
+func GetWebhookUrl(vcs *models.Vcs, apiToken string) string {
+	webhookUrl := configs.Get().Portal.Address + "/api/v1"
+	switch vcs.VcsType {
+	case models.VcsGitlab:
+		webhookUrl += WebhookUrlGitlab
+	case models.VcsGitea:
+		webhookUrl += WebhookUrlGitea
+	case models.VcsGitee:
+		webhookUrl += WebhookUrlGitee
+	case models.VcsGithub:
+		webhookUrl += WebhookUrlGithub
+	}
+	webhookUrl += fmt.Sprintf("/%s?token=%s", vcs.Id.String(), apiToken)
+	return webhookUrl
 }

@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/pkg/errors"
 
 	"cloudiac/portal/consts"
 	"cloudiac/portal/models"
@@ -20,13 +19,14 @@ import (
 	"cloudiac/portal/services/logstorage"
 	"cloudiac/runner"
 	"cloudiac/utils"
-	"cloudiac/utils/kafka"
 	"cloudiac/utils/logs"
 )
 
 // StartTaskStep 启动任务的一步
 // 该函数会设置 taskReq 中 step 相关的数据
-func StartTaskStep(taskReq runner.RunTaskReq, step models.TaskStep) (err error, reTryAble bool) {
+func StartTaskStep(taskReq runner.RunTaskReq, step models.TaskStep) (
+	containerId string, retryAble bool, err error) {
+
 	logger := logs.Get().
 		WithField("action", "StartTaskStep").
 		WithField("taskId", taskReq.TaskId).
@@ -38,10 +38,10 @@ func StartTaskStep(taskReq runner.RunTaskReq, step models.TaskStep) (err error, 
 	var runnerAddr string
 	runnerAddr, err = services.GetRunnerAddress(taskReq.RunnerId)
 	if err != nil {
-		return errors.Wrapf(err, "get runner '%s' address", taskReq.RunnerId), true
+		return "", true, err
 	}
 
-	requestUrl := utils.JoinURL(runnerAddr, consts.RunnerRunTaskURL)
+	requestUrl := utils.JoinURL(runnerAddr, consts.RunnerRunTaskStepURL)
 	logger.Debugf("request runner: %s", requestUrl)
 
 	taskReq.Step = step.Index
@@ -49,21 +49,28 @@ func StartTaskStep(taskReq runner.RunTaskReq, step models.TaskStep) (err error, 
 	taskReq.StepArgs = step.Args
 
 	respData, err := utils.HttpService(requestUrl, "POST", header, taskReq,
-		int(consts.RunnerConnectTimeout.Seconds()), int(consts.RunnerConnectTimeout.Seconds()))
+		int(consts.RunnerConnectTimeout.Seconds()), int(consts.RunnerConnectTimeout.Seconds())*10)
 	if err != nil {
-		return err, true
+		return "", true, err
 	}
 
 	resp := runner.Response{}
 	if err := json.Unmarshal(respData, &resp); err != nil {
-		return fmt.Errorf("unexpected response: %s", respData), false
+		return "", false, fmt.Errorf("unexpected response: %s", respData)
 	}
 	logger.Debugf("runner response: %s", respData)
 
 	if resp.Error != "" {
-		return fmt.Errorf(resp.Error), false
+		return "", false, fmt.Errorf(resp.Error)
 	}
-	return nil, false
+
+	if result, ok := resp.Result.(map[string]interface{}); !ok {
+		return "", false, fmt.Errorf("unexpected result: %v", resp.Result)
+	} else {
+		containerId = fmt.Sprintf("%v", result["containerId"])
+	}
+
+	return containerId, false, nil
 }
 
 type waitStepResult struct {
@@ -73,14 +80,16 @@ type waitStepResult struct {
 
 // WaitTaskStep 等待任务结束(包括超时)，返回任务最新状态
 // 该函数会更新任务状态、日志等到 db
-// param: taskDeadline 任务超时时间，达到这个时间后任务会被置为 timeout 状态
 func WaitTaskStep(ctx context.Context, sess *db.Session, task *models.Task, step *models.TaskStep) (
 	stepResult *waitStepResult, err error) {
 	logger := logs.Get().WithField("action", "WaitTaskStep").WithField("taskId", task.Id)
 	if step.StartAt == nil {
 		return nil, fmt.Errorf("step not start")
 	}
-	taskDeadline := time.Time(*step.StartAt).Add(time.Duration(task.StepTimeout) * time.Second)
+
+	// runner 端己经增加了超时处理，portal 端的超时暂时保留，但时间设置为给定时间的 2 倍
+	taskDeadline := time.Time(*step.StartAt).Add(time.Duration(task.StepTimeout*2) * time.Second)
+
 	// 当前版本实现中需要 portal 主动连接到 runner 获取状态
 	err = utils.RetryFunc(10, time.Second*10, func(retryN int) (retry bool, er error) {
 		stepResult, er = pullTaskStepStatus(ctx, task, step, taskDeadline)
@@ -91,7 +100,7 @@ func WaitTaskStep(ctx context.Context, sess *db.Session, task *models.Task, step
 
 		// 正常情况下 pullTaskStepStatus() 应该在 runner 任务退出后才返回，
 		// 但发现有任务在 running 状态时函数返回的情况，所以这里进行一次状态检查，如果任务不是退出状态则继续重试
-		if !(models.Task{}).IsExitedStatus(stepResult.Status) {
+		if !(models.TaskStep{}).IsExitedStatus(stepResult.Status) {
 			logger.Warnf("pull task status done, but task status is '%s', retry(%d)", stepResult.Status, retryN)
 			return true, nil
 		}
@@ -100,12 +109,7 @@ func WaitTaskStep(ctx context.Context, sess *db.Session, task *models.Task, step
 	if err != nil {
 		return stepResult, err
 	}
-	if stepResult.Status != models.TaskRunning && task.Extra.Source == consts.WorkFlow {
-		k := kafka.Get()
-		if err := k.ConnAndSend(k.GenerateKafkaContent(task.Extra.TransitionId, stepResult.Status)); err != nil {
-			logger.Errorf("kafka send error: %v", err)
-		}
-	}
+
 	if len(stepResult.Result.LogContent) > 0 {
 		content := stepResult.Result.LogContent
 		content = logstorage.CutLogContent(content)
@@ -144,8 +148,17 @@ func WaitTaskStep(ctx context.Context, sess *db.Session, task *models.Task, step
 			logger.WithField("path", path).Errorf("write task scan result json error: %v", err)
 		}
 	}
+
+	message := ""
+	switch stepResult.Status {
+	case models.TaskStepFailed:
+		message = "failed"
+	case models.TaskStepTimeout:
+		message = "timeout"
+	}
+
 	if er := services.ChangeTaskStepStatusAndExitCode(
-		sess, task, step, stepResult.Status, "", stepResult.Result.ExitCode); er != nil {
+		sess, task, step, stepResult.Status, message, stepResult.Result.ExitCode); er != nil {
 		return stepResult, er
 	}
 	return stepResult, err
@@ -159,14 +172,14 @@ func pullTaskStepStatus(ctx context.Context, task models.Tasker, step *models.Ta
 
 	runnerAddr, err := services.GetRunnerAddress(task.GetRunnerId())
 	if err != nil {
-		return nil, errors.Wrapf(err, "get runner address")
+		return nil, err
 	}
 
 	params := url.Values{}
 	params.Add("envId", string(step.EnvId))
 	params.Add("taskId", string(step.TaskId))
 	params.Add("step", fmt.Sprintf("%d", step.Index))
-	wsConn, resp, err := utils.WebsocketDail(runnerAddr, consts.RunnerTaskStateURL, params)
+	wsConn, resp, err := utils.WebsocketDail(runnerAddr, consts.RunnerTaskStepStatusURL, params)
 	if err != nil {
 		logger.Errorf("connect error: %v", err)
 		if resp != nil && resp.StatusCode >= 300 {
@@ -206,7 +219,7 @@ func pullTaskStepStatus(ctx context.Context, task models.Tasker, step *models.Ta
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 					logger.Tracef("read message error: %v", err)
 				} else {
-					logger.Errorf("read message error: %v", err)
+					logger.Warnf("read message error: %v", err)
 					if checkDone() {
 						return
 					}
@@ -244,11 +257,14 @@ func pullTaskStepStatus(ctx context.Context, task models.Tasker, step *models.Ta
 
 				stepResult.Result = *msg
 				//logger.Debugf("receive task status message: %v, %v", msg.Exited, msg.ExitCode)
-				if msg.Exited {
+
+				if msg.Timeout {
+					stepResult.Status = models.TaskStepTimeout
+				} else if msg.Exited {
 					if msg.ExitCode == 0 {
-						stepResult.Status = models.TaskComplete
+						stepResult.Status = models.TaskStepComplete
 					} else {
-						stepResult.Status = models.TaskFailed
+						stepResult.Status = models.TaskStepFailed
 					}
 					return nil
 				}
@@ -266,9 +282,10 @@ func pullTaskStepStatus(ctx context.Context, task models.Tasker, step *models.Ta
 		}
 	}
 
-	logger.Infof("pulling step %s status ...", step.Name)
+	logger.Debugf("pulling step status, step=%s(%d)", step.Type, step.Index)
 	err = selectLoop()
-	logger.Infof("pull step %s status done, status=%v code=%d", step.Name, stepResult.Status, stepResult.Result.ExitCode)
+	logger.Debugf("pull step status done, step=%s(%d), status=%v code=%d",
+		step.Type, step.Index, stepResult.Status, stepResult.Result.ExitCode)
 
 	return stepResult, nil
 }
@@ -315,7 +332,9 @@ func WaitScanTaskStep(ctx context.Context, sess *db.Session, task *models.ScanTa
 	if step.StartAt == nil {
 		return nil, fmt.Errorf("step not start")
 	}
-	taskDeadline := time.Time(*step.StartAt).Add(time.Duration(task.StepTimeout) * time.Second)
+
+	// runner 端己经增加了超时处理，portal 端的超时暂时保留，但时间设置为给定时间的 2 倍
+	taskDeadline := time.Time(*step.StartAt).Add(time.Duration(task.StepTimeout*2) * time.Second)
 
 	// 当前版本实现中需要 portal 主动连接到 runner 获取状态
 	err = utils.RetryFunc(10, time.Second*10, func(retryN int) (retry bool, er error) {
@@ -335,13 +354,6 @@ func WaitScanTaskStep(ctx context.Context, sess *db.Session, task *models.ScanTa
 	})
 	if err != nil {
 		return stepResult, err
-	}
-
-	if stepResult.Status != models.TaskRunning && task.Extra.Source == consts.WorkFlow {
-		k := kafka.Get()
-		if err := k.ConnAndSend(k.GenerateKafkaContent(task.Extra.TransitionId, stepResult.Status)); err != nil {
-			logger.Errorf("kafka send error: %v", err)
-		}
 	}
 
 	if len(stepResult.Result.LogContent) > 0 {
@@ -364,6 +376,13 @@ func WaitScanTaskStep(ctx context.Context, sess *db.Session, task *models.ScanTa
 			logger.WithField("path", path).Errorf("write task scan result json error: %v", err)
 		}
 	}
+	// 合规任务暂时不需要发送消息
+	//if stepResult.Status != models.TaskRunning && task.Extra.Source == consts.WorkFlow {
+	//	k := kafka.Get()
+	//	if err := k.ConnAndSend(k.GenerateKafkaContent(task.Extra.TransitionId, stepResult.Status)); err != nil {
+	//		logger.Errorf("kafka send error: %v", err)
+	//	}
+	//}
 
 	if er := services.ChangeTaskStepStatusAndExitCode(
 		sess, task, step, stepResult.Status, "", stepResult.Result.ExitCode); er != nil {

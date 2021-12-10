@@ -22,17 +22,17 @@ provider plugin 的查找逻辑:
 const (
 	ContainerWorkspace = "/cloudiac/workspace"
 
-	ContainerAssetsDir       = "/cloudiac/assets"             // 挂载依赖资源，如 terraform.py 等(可以考虑打包到镜像?)
-	ContainerPluginPath      = "/usr/share/terraform/plugins" // 预置 providers 目录(可以考虑打包到镜像?)
-	ContainerPluginCachePath = "/terraform/plugins-cache"     // terraform plugins 缓存目录
+	ContainerAssetsDir       = "/cloudiac/assets"                  // 挂载依赖资源，如 terraform.py 等(己打包到 worker 镜像)
+	ContainerPluginPath      = "/cloudiac/terraform/plugins"       // 预置 providers 目录(己打包到镜像)
+	ContainerPluginCachePath = "/cloudiac/terraform/plugins-cache" // terraform plugins 缓存目录
 )
 
 const (
-	TaskStepScriptName = "run.sh"
-	TaskStepLogName    = "output.log"
+	TaskScriptName = "run.sh"
+	TaskLogName    = "output.log"
 
-	TaskStepInfoFileName          = "info.json"
-	TaskStepContainerInfoFileName = "container.json"
+	TaskInfoFileName          = "info.json"
+	TaskContainerInfoFileName = "container.json"
 
 	CloudIacTfFile   = "_cloudiac.tf"
 	CloudIacPlayVars = "_cloudiac_play_vars.yml"

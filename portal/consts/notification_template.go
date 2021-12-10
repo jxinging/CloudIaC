@@ -39,6 +39,7 @@ var IacTaskRunning = `
 <p>	云模板：{{.TemplateName}}</p>
 <p>	分支/tag：{{.Revision}}</p>
 <p>	环境名称：{{.EnvName}}</p>
+<p>	任务类型：{{.TaskType}}</p>
 <br />	
 <p>	更多详情请点击：{{.Addr}}</p>
 <br />	
@@ -59,11 +60,44 @@ var IacTaskCompleteTpl = `
 <p>	云模板：{{.TemplateName}}</p>
 <p>	分支/tag：{{.Revision}}</p>
 <p>	环境名称：{{.EnvName}}</p>
+<p>	任务类型：{{.TaskType}}</p>
 <p>	执行结果：成功</p>
 <p>	资源数量：{{.ResAdded}}+ {{.ResChanged}}~ {{.ResDestroyed}}-</p>
 <br />	
 <p>	更多详情请点击：{{.Addr}}</p>
 <br />	
+<p>	-----该邮件由系统自动发出，请勿回复-----</p>
+</body>
+</html>
+`
+
+var IacCronDriftPlanTaskTpl = `
+<html>
+<body>
+<p>尊敬的 CloudIaC 用户：</p>
+<br />
+<p>	{{.EnvName}}环境检测到资源配置发生漂移,详情如下：</p> 
+<br />	
+<p>	所属组织：{{.OrgName}}</p>
+<p>	所属项目：{{.ProjectName}}</p>
+<p>	云模板：{{.TemplateName}}</p>
+<p>	分支/tag：{{.Revision}}</p>
+<p>	-----该邮件由系统自动发出，请勿回复-----</p>
+</body>
+</html>
+`
+
+var IacCronDriftApplyTaskTpl = `
+<html>
+<body>
+<p>尊敬的 CloudIaC 用户：</p>
+<br />
+<p>	{{.EnvName}}环境检测到资源配置发生漂移,自动纠偏成功，详情如下：</p> 
+<br />	
+<p>	所属组织：{{.OrgName}}</p>
+<p>	所属项目：{{.ProjectName}}</p>
+<p>	云模板：{{.TemplateName}}</p>
+<p>	分支/tag：{{.Revision}}</p>
 <p>	-----该邮件由系统自动发出，请勿回复-----</p>
 </body>
 </html>
@@ -81,6 +115,7 @@ var IacTaskFailedTpl = `
 <p>	云模板：{{.TemplateName}}</p>
 <p>	分支/tag：{{.Revision}}</p>
 <p>	环境名称：{{.EnvName}}</p>
+<p>	任务类型：{{.TaskType}}</p>
 <p>	执行结果：失败</p>
 <p>	失败原因：{{.Message}}</p>
 <br />	
@@ -103,8 +138,8 @@ var IacTaskApprovingTpl = `
 <p>	云模板：{{.TemplateName}}</p>
 <p>	分支/tag：{{.Revision}}</p>
 <p>	环境名称：{{.EnvName}}</p>
+<p>	任务类型：{{.TaskType}}</p>
 <p>	执行结果：审批中</p>
-<p>	失败原因：{{.Message}}</p>
 <br />	
 <p>	更多详情请点击：{{.Addr}}</p>
 <br />	
@@ -129,6 +164,8 @@ const (
 
 	环境名称：{{.EnvName}}
 
+	任务类型：{{.TaskType}}
+
 	更多详情请点击：{{.Addr}}
 
 	-----该消息由系统自动发出，请勿回复-----
@@ -149,9 +186,9 @@ const (
 
 	环境名称：{{.EnvName}}
 
-	执行结果：审批中
+	任务类型：{{.TaskType}}
 
-	失败原因：{{.Message}}
+	执行结果：审批中
 
 	更多详情请点击：{{.Addr}}
 
@@ -172,6 +209,8 @@ const (
 	分支/tag：{{.Revision}}
 
 	环境名称：{{.EnvName}}
+
+	任务类型：{{.TaskType}}
 
 	执行结果：失败
 
@@ -197,6 +236,8 @@ const (
 
 	环境名称：{{.EnvName}}
 
+	任务类型：{{.TaskType}}
+
 	执行结果：成功
 
 	资源数量：{{.ResAdded}}+ {{.ResChanged}}~ {{.ResDestroyed}}-
@@ -204,5 +245,37 @@ const (
 	更多详情请点击：{{.Addr}}
 
 	-----该消息由系统自动发出，请勿回复-----
+`
+	IacCronDriftPlanTaskMarkDown = `
+尊敬的CloudIaC用户：
+
+  {{.EnvName}}环境检测到资源配置发生漂移,详情如下：
+
+  所属组织：{{.OrgName}}
+
+  所属项目：{{.ProjectName}}
+
+  云模板：{{.TemplateName}}
+
+  分支/tag：{{.Revision}}
+
+
+  -----该消息由系统自动发出，请勿回复-----
+`
+	IacCronDriftApplyTaskMarkDown = `
+尊敬的CloudIaC用户：
+
+  {{.EnvName}}环境检测到资源配置发生漂移,自动纠偏成功，详情如下：
+
+  所属组织：{{.OrgName}}
+
+  所属项目：{{.ProjectName}}
+
+  云模板：{{.TemplateName}}
+
+  分支/tag：{{.Revision}}
+
+
+  -----该消息由系统自动发出，请勿回复-----
 `
 )
