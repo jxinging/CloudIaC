@@ -46,8 +46,9 @@ jobs:
     - name: Release
       uses: softprops/action-gh-release@v1
       if: startsWith(github.ref, 'refs/tags/v')
-      files: |
-        cloudiac_$VERSION.tar.gz
-        cloudiac-repos_$VERSION.tar.gz
-        cloudiac-providers_$VERSION.tar.gz
+      with:
+        files: |
+          cloudiac_$VERSION.tar.gz
+          cloudiac-repos_$VERSION.tar.gz
+          cloudiac-providers_$VERSION.tar.gz
 
