@@ -34,7 +34,7 @@ jobs:
 
     - name: Pack
       run: |
-        rm cloudiac_v*.tar.gz cloudiac-repos_v*.tar.gz cloudiac-providers_v*.tar.gz && \
+        rm -vf cloudiac_v*.tar.gz cloudiac-repos_v*.tar.gz cloudiac-providers_v*.tar.gz && \
         make package && make repos-package && make providers-package && \
         mv cloudiac_v*.tar.gz cloudiac_$VERSION.tar.gz && \
         mv cloudiac-repos_v*.tar.gz cloudiac-repos_$VERSION.tar.gz && \
